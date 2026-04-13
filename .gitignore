@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual env
+.venv/
+venv/
+
+# CDK
+cdk.out/
+.cdk.staging/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+package-lock.json
+
+# AgentCore toolkit
+.bedrock_agentcore/
+
+# AgentCore CLI state, logs & CDK build artifacts
+agentcore/.cli/
+agentcore/cdk/node_modules/
+agentcore/cdk/package-lock.json
+agentcore/cdk/cdk.out/
+agentcore/cdk/dist/
+
+# Secrets (never commit)
+.env
+*.pem
+credentials.json
+
+# Lambda vendored dependencies
+lambda/router/nacl/
+lambda/router/cffi/
+lambda/router/_cffi_backend*
+lambda/router/pycparser/
+lambda/router/*.dist-info/
+
+# Docker / submodule
+hermes-agent/

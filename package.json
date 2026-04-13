@@ -1,0 +1,19 @@
+{
+  "name": "sample-host-harmesagent-on-amazon-bedrock-agentcore",
+  "version": "1.0.0",
+  "description": "Deploy [hermes-agent](https://github.com/nousresearch/hermes-agent) (a self-improving AI agent with 40+ tools, multi-platform messaging, and skill learning) on **Amazon Bedrock AgentCore** — providing per-user isolation, serverless scaling, and managed Bedrock model access.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "aws-cdk": "^2.1118.0"
+  }
+}

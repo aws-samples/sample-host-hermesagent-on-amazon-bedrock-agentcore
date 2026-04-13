@@ -1,0 +1,8 @@
+[
+  {
+    "name": "default",
+    "description": "Default deployment target",
+    "account": "350350805905",
+    "region": "us-west-2"
+  }
+]

@@ -39,7 +39,7 @@
 
     "alarm_email": "",
 
-    "agentcore_runtime_arn": "arn:aws:bedrock-agentcore:us-west-2:350350805905:runtime/hermes_hermes-4B3kjbFQig",
-    "agentcore_qualifier": "hermes_hermes-4B3kjbFQig"
+    "agentcore_runtime_arn": "arn:aws:bedrock-agentcore:us-west-2:687912291502:runtime/hermes_hermes-DnObWO65fY",
+    "agentcore_qualifier": "hermes_hermes-DnObWO65fY"
   }
 }

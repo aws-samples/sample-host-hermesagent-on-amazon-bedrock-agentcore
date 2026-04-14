@@ -72,6 +72,8 @@ def handler(event: dict, context: Any) -> dict:
             return _handle_slack(event)
         elif path.startswith("/webhook/discord"):
             return _handle_discord(event)
+        elif path.startswith("/webhook/feishu"):
+            return _handle_feishu(event)
         elif path == "/health":
             return _ok({"status": "healthy", "timestamp": int(time.time())})
         else:
@@ -438,6 +440,113 @@ def _discord_followup(ctx: dict) -> None:
         logger.error("Discord followup edit failed: %s %s — %s", exc.code, exc.reason, body)
     except Exception as exc:
         logger.error("Discord followup edit failed: %s", exc)
+
+
+# --------------------------------------------------------------------------
+# Feishu (Lark)
+# --------------------------------------------------------------------------
+
+def _handle_feishu(event: dict) -> dict:
+    body = _parse_body(event)
+    logger.info("Feishu body: %s", json.dumps(body, ensure_ascii=False)[:2000])
+
+    # Feishu URL verification challenge.
+    if body.get("type") == "url_verification":
+        return _ok({"challenge": body.get("challenge", "")})
+
+    # Parse event (Feishu 2.0 event format).
+    header = body.get("header", {})
+    event_type = header.get("event_type", "")
+    feishu_event = body.get("event", {})
+
+    # Only handle im.message.receive_v1 events.
+    if event_type != "im.message.receive_v1":
+        return _ok({"status": "ignored"})
+
+    sender = feishu_event.get("sender", {}).get("sender_id", {})
+    user_id = sender.get("open_id", "")
+    message = feishu_event.get("message", {})
+    chat_id = message.get("chat_id", "")
+    msg_type = message.get("message_type", "")
+
+    # Only handle text messages for now.
+    if msg_type != "text":
+        return _ok({"status": "ignored"})
+
+    try:
+        content = json.loads(message.get("content", "{}"))
+        text = content.get("text", "")
+    except (json.JSONDecodeError, ValueError):
+        text = ""
+
+    actor_id = f"feishu:{user_id}"
+
+    if not text.strip() or not _is_allowed(actor_id):
+        return _ok({"status": "blocked"})
+
+    hermes_user_id = _resolve_user(actor_id)
+    session_id = _build_session_id(hermes_user_id, "feishu")
+
+    payload = {
+        "action": "chat",
+        "userId": hermes_user_id,
+        "actorId": actor_id,
+        "channel": "feishu",
+        "chatId": chat_id,
+        "message": text,
+    }
+
+    agent_response = _invoke_agentcore(session_id, actor_id, payload)
+
+    # Reply via Feishu API.
+    _send_feishu_message(chat_id, message.get("message_id", ""), agent_response)
+
+    return _ok({"status": "ok"})
+
+
+def _send_feishu_message(chat_id: str, message_id: str, text: str) -> None:
+    """Reply to a Feishu message."""
+    if not text:
+        return
+
+    token = _get_feishu_tenant_token()
+    url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply"
+    data = json.dumps({
+        "content": json.dumps({"text": text}),
+        "msg_type": "text",
+    }).encode()
+    req = urllib.request.Request(url, data=data, headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    })
+    try:
+        urllib.request.urlopen(req, timeout=15)
+    except Exception as exc:
+        logger.error("Feishu reply failed: %s", exc)
+
+
+def _get_feishu_tenant_token() -> str:
+    """Get Feishu tenant_access_token using app credentials."""
+    # Check cache first (token valid for ~2 hours, we cache in Lambda container).
+    cached = _secrets_cache.get("_feishu_tenant_token")
+    cached_at = _secrets_cache.get("_feishu_tenant_token_at", 0)
+    if cached and (time.time() - cached_at) < 6000:  # refresh every ~100 min
+        return cached
+
+    app_id = _get_secret("feishu-app-id")
+    app_secret = _get_secret("feishu-app-secret")
+
+    url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+    data = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode()
+    req = urllib.request.Request(url, data=data, headers={
+        "Content-Type": "application/json",
+    })
+    resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+    token = resp.get("tenant_access_token", "")
+
+    _secrets_cache["_feishu_tenant_token"] = token
+    _secrets_cache["_feishu_tenant_token_at"] = time.time()
+    return token
 
 
 # --------------------------------------------------------------------------

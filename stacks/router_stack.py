@@ -145,6 +145,7 @@ class HermesRouterStack(Stack):
             ("/webhook/telegram", [apigwv2.HttpMethod.POST]),
             ("/webhook/slack", [apigwv2.HttpMethod.POST]),
             ("/webhook/discord", [apigwv2.HttpMethod.POST]),
+            ("/webhook/feishu", [apigwv2.HttpMethod.POST]),
             ("/health", [apigwv2.HttpMethod.GET]),
         ]
         for path, methods in routes:

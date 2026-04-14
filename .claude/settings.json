@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -r \"region\\\\|Region\" /Users/tangqy/workspaces/sample-host-hermesagent-on-amazon-bedrock-agentcore/stacks/*.py)",
+      "Bash(ls -la /Users/tangqy/workspaces/sample-host-hermesagent-on-amazon-bedrock-agentcore/.bedrock*)",
+      "Bash(aws logs:*)",
+      "Bash(curl -s -X POST https://y2byqip0wj.execute-api.us-west-2.amazonaws.com/webhook/feishu -H \"Content-Type: application/json\" -d '{\"type\":\"url_verification\",\"challenge\":\"test123\"}')",
+      "Bash(aws lambda:*)",
+      "Bash(aws apigatewayv2:*)",
+      "Bash(aws secretsmanager:*)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\({k:v for k,v in d.get\\('context',{}\\).items\\(\\) if 'agentcore' in k.lower\\(\\) or 'runtime' in k.lower\\(\\)}, indent=2\\)\\)\")",
+      "Bash(git stash:*)",
+      "Bash(git pull:*)"
+    ]
+  }
+}

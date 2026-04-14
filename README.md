@@ -1,11 +1,13 @@
 # Hermes Agent on Amazon Bedrock AgentCore
 
+English | [中文](README_ZH.md)
+
 Deploy [Hermes Agent](https://github.com/NousResearch/hermes-agent) on **Amazon Bedrock AgentCore** — per-user Firecracker microVMs with automatic scaling, native Bedrock Claude models, and multi-channel messaging.
 
 ## Architecture
 
 ```
-Telegram / Slack / Discord
+Telegram / Slack / Discord / Feishu
          │
     API Gateway
          │
@@ -22,7 +24,7 @@ Telegram / Slack / Discord
 
 - **Per-user isolation** — Firecracker microVMs, one per session
 - **Serverless** — No servers to manage, auto-scaling, pay-per-use
-- **Multi-channel** — Telegram, Slack, Discord via webhook integration
+- **Multi-channel** — Telegram, Slack, Discord, Feishu (Lark) via webhook integration
 - **Native Bedrock** — Claude models via SigV4 auth (no API keys needed)
 - **Infrastructure as Code** — 8 CDK stacks, three-phase deployment
 - **Persistent state** — S3-backed workspace for memory and sessions
@@ -167,6 +169,16 @@ Configure webhooks after Phase 3 deployment:
 ./scripts/setup_slack.sh
 ```
 
+### Feishu (Lark)
+
+1. Create an app at [Feishu Open Platform](https://open.feishu.cn)
+2. Enable Bot capability, configure permissions (`im:message`, `im:message:send_as_bot`)
+3. Set Event Subscription URL to `{API_URL}webhook/feishu`, subscribe to `im.message.receive_v1`
+4. Store App ID, App Secret, Verification Token in Secrets Manager
+5. Add user `open_id` to DynamoDB allowlist
+
+See [docs/FEISHU_SETUP.md](docs/FEISHU_SETUP.md) for step-by-step instructions.
+
 ## Configuration
 
 Key settings in `cdk.json`:
@@ -198,6 +210,7 @@ Key settings in `cdk.json`:
 | [DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md) | Step-by-step setup and troubleshooting |
 | [INVOKE_GUIDE.md](docs/INVOKE_GUIDE.md) | All invocation methods (CLI, SDK, HTTP) |
 | [DISCORD_SETUP.md](docs/DISCORD_SETUP.md) | Discord bot configuration |
+| [FEISHU_SETUP.md](docs/FEISHU_SETUP.md) | Feishu (Lark) bot configuration |
 | [AGENTCORE_CONTRACT.md](docs/AGENTCORE_CONTRACT.md) | HTTP contract protocol details |
 
 ## Reference

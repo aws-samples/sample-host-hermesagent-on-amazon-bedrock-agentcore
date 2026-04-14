@@ -21,7 +21,7 @@ COPY hermes-agent/ /build/hermes-agent/
 
 # Install hermes-agent + bridge deps into a prefix we can copy later.
 RUN pip install --no-cache-dir --prefix=/install \
-        -e "/build/hermes-agent[cron,mcp]" \
+        -e "/build/hermes-agent[bedrock,cron,mcp]" \
         boto3 botocore litellm \
     && pip install --no-cache-dir --prefix=/install \
         boto3 botocore litellm

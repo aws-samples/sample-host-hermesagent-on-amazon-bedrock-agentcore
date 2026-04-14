@@ -245,8 +245,8 @@ def _init_full_agent() -> None:
 
         from run_agent import AIAgent  # noqa: WPS433
 
-        model = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-sonnet-4-6-v1")
-        provider = os.environ.get("HERMES_PROVIDER", "anthropic")
+        model = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-6")
+        provider = os.environ.get("HERMES_PROVIDER", "bedrock")
         base_url = os.environ.get("HERMES_BASE_URL", "")
 
         kwargs: dict[str, Any] = {

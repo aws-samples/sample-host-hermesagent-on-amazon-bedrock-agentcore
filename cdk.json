@@ -20,7 +20,7 @@
     "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
     "@aws-cdk/core:stackRelativeExports": true,
 
-    "default_model_id": "global.anthropic.claude-opus-4-6-v1",
+    "default_model_id": "us.anthropic.claude-sonnet-4-6",
     "warmup_model_id": "global.anthropic.claude-sonnet-4-6-v1",
 
     "session_idle_timeout": 1800,

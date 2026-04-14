@@ -85,7 +85,7 @@ Hermes Agent runs unmodified inside AgentCore containers. The key integration is
 
 ```bash
 # Clone
-git clone https://github.com/stevensu1977/sample-host-hermesagent-on-amazon-bedrock-agentcore.git
+git clone https://github.com/aws-samples/sample-host-hermesagent-on-amazon-bedrock-agentcore.git
 cd sample-host-hermesagent-on-amazon-bedrock-agentcore
 
 # Setup Python environment

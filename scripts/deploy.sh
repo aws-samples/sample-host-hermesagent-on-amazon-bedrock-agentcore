@@ -79,14 +79,13 @@ phase2() {
 
     # Copy hermes-agent source into the app/hermes/ Docker build context.
     if [ ! -d "$PROJECT_DIR/app/hermes/hermes-agent" ]; then
-        if [ -d "$HOME/hermes-agent" ]; then
-            info "Copying hermes-agent source into app/hermes/ for Docker build …"
-            rsync -a --exclude='.git' --exclude='node_modules' --exclude='__pycache__' \
-                "$HOME/hermes-agent/" "$PROJECT_DIR/app/hermes/hermes-agent/"
-        else
-            error "hermes-agent source not found. Place it at ~/hermes-agent"
-            exit 1
+        if [ ! -d "$HOME/hermes-agent" ]; then
+            info "hermes-agent not found at $HOME/hermes-agent — cloning …"
+            git clone https://github.com/NousResearch/hermes-agent.git "$HOME/hermes-agent"
         fi
+        info "Copying hermes-agent source into app/hermes/ for Docker build …"
+        rsync -a --exclude='.git' --exclude='node_modules' --exclude='__pycache__' \
+            "$HOME/hermes-agent/" "$PROJECT_DIR/app/hermes/hermes-agent/"
     fi
 
     # Copy bridge/ into app/hermes/ so Dockerfile can access it.

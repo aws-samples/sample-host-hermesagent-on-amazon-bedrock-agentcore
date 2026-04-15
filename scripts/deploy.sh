@@ -77,6 +77,24 @@ phase2() {
         npm install -g @aws/agentcore
     fi
 
+    # Ensure aws-targets.json exists (agentcore CDK requires it).
+    if [ ! -f "$PROJECT_DIR/agentcore/aws-targets.json" ]; then
+        info "Generating agentcore/aws-targets.json from current AWS credentials …"
+        _ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+        _REGION=$(aws configure get region 2>/dev/null || echo "us-west-2")
+        cat > "$PROJECT_DIR/agentcore/aws-targets.json" <<TARGETS
+[
+  {
+    "name": "default",
+    "description": "Default deployment target",
+    "account": "$_ACCOUNT",
+    "region": "$_REGION"
+  }
+]
+TARGETS
+        info "Created aws-targets.json (account=$_ACCOUNT, region=$_REGION)"
+    fi
+
     # Copy hermes-agent source into the app/hermes/ Docker build context.
     if [ ! -d "$PROJECT_DIR/app/hermes/hermes-agent" ]; then
         if [ ! -d "$HOME/hermes-agent" ]; then

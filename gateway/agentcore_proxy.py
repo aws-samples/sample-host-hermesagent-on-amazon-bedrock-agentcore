@@ -20,13 +20,19 @@ import os
 import time
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import ClientError, ReadTimeoutError
 
 RUNTIME_ARN = os.environ.get("AGENTCORE_RUNTIME_ARN", "")
 QUALIFIER = os.environ.get("AGENTCORE_QUALIFIER", "")
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 
-_client = boto3.client("bedrock-agentcore", region_name=AWS_REGION)
+_boto_config = BotoConfig(
+    read_timeout=300,      # 5 minutes — AgentCore agent may take a while
+    connect_timeout=10,
+    retries={"max_attempts": 0},  # We handle retries ourselves
+)
+_client = boto3.client("bedrock-agentcore", region_name=AWS_REGION, config=_boto_config)
 logger = logging.getLogger("agentcore_proxy")
 
 
@@ -89,6 +95,14 @@ class AgentCoreProxyAgent:
             try:
                 response = _client.invoke_agent_runtime(**kwargs)
                 return _parse_response(response)
+            except ReadTimeoutError as e:
+                if attempt < max_retries:
+                    wait = 2 ** attempt
+                    logger.warning("AgentCore ReadTimeout (attempt %d/%d), retrying in %ds", attempt + 1, max_retries + 1, wait)
+                    time.sleep(wait)
+                    continue
+                logger.error("AgentCore read timeout after %d attempts: %s", max_retries + 1, e)
+                return "Sorry, I encountered a timeout. The agent may be processing a complex request. Please try again."
             except ClientError as e:
                 code = e.response["Error"]["Code"]
                 if code in ("ThrottlingException", "ServiceUnavailableException") and attempt < max_retries:

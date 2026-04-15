@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir \
 
 # Copy the AgentCore proxy bridge.
 COPY agentcore_proxy.py /app/agentcore_proxy.py
+COPY weixin_file_patch.py /app/weixin_file_patch.py
 COPY main.py /app/main.py
 
 # Simple health-check endpoint — curl localhost:8080/health

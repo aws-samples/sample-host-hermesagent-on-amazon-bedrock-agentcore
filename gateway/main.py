@@ -42,7 +42,11 @@ def main():
     from agentcore_proxy import patch_aiagent
     patch_aiagent()
 
-    # Step 2: Import and run the hermes-agent gateway.
+    # Step 2: Patch WeixinAdapter.send() for auto-file delivery.
+    from weixin_file_patch import patch_weixin_send
+    patch_weixin_send()
+
+    # Step 3: Import and run the hermes-agent gateway.
     from gateway.run import start_gateway
     logger.info("Starting hermes-agent gateway (protocol adapters only)")
     success = asyncio.run(start_gateway(replace=True, verbosity=1))

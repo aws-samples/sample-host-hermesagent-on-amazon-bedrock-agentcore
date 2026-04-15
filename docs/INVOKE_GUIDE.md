@@ -1,6 +1,6 @@
 # Hermes Agent on AgentCore — 调用指南
 
-> **Runtime ARN**: `arn:aws:bedrock-agentcore:us-west-2:350350805905:runtime/hermes_hermes-4B3kjbFQig`
+> **Runtime ARN**: `arn:aws:bedrock-agentcore:us-west-2:YOUR_ACCOUNT_ID:runtime/YOUR_RUNTIME_ID`
 > **Region**: `us-west-2`
 > **Model**: `us.anthropic.claude-sonnet-4-6`
 
@@ -76,7 +76,7 @@ agentcore status --json
 ```bash
 aws bedrock-agentcore invoke-agent-runtime \
   --region us-west-2 \
-  --agent-runtime-arn "arn:aws:bedrock-agentcore:us-west-2:350350805905:runtime/hermes_hermes-4B3kjbFQig" \
+  --agent-runtime-arn "arn:aws:bedrock-agentcore:us-west-2:YOUR_ACCOUNT_ID:runtime/YOUR_RUNTIME_ID" \
   --payload '{"prompt": "你好，请用中文回答"}' \
   /dev/stdout
 ```
@@ -86,7 +86,7 @@ aws bedrock-agentcore invoke-agent-runtime \
 ```bash
 aws bedrock-agentcore invoke-agent-runtime \
   --region us-west-2 \
-  --agent-runtime-arn "arn:aws:bedrock-agentcore:us-west-2:350350805905:runtime/hermes_hermes-4B3kjbFQig" \
+  --agent-runtime-arn "arn:aws:bedrock-agentcore:us-west-2:YOUR_ACCOUNT_ID:runtime/YOUR_RUNTIME_ID" \
   --runtime-session-id "my-session-001" \
   --payload '{"prompt": "记住我的名字是 Steven"}' \
   /dev/stdout
@@ -97,7 +97,7 @@ aws bedrock-agentcore invoke-agent-runtime \
 ```bash
 aws bedrock-agentcore invoke-agent-runtime \
   --region us-west-2 \
-  --agent-runtime-arn "arn:aws:bedrock-agentcore:us-west-2:350350805905:runtime/hermes_hermes-4B3kjbFQig" \
+  --agent-runtime-arn "arn:aws:bedrock-agentcore:us-west-2:YOUR_ACCOUNT_ID:runtime/YOUR_RUNTIME_ID" \
   --runtime-user-id "user-steven" \
   --payload '{"prompt": "你好"}' \
   /dev/stdout
@@ -119,7 +119,7 @@ pip install boto3
 import boto3
 import json
 
-RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-west-2:350350805905:runtime/hermes_hermes-4B3kjbFQig"
+RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-west-2:YOUR_ACCOUNT_ID:runtime/YOUR_RUNTIME_ID"
 
 client = boto3.client("bedrock-agentcore", region_name="us-west-2")
 
@@ -142,7 +142,7 @@ print()
 import boto3
 import json
 
-RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-west-2:350350805905:runtime/hermes_hermes-4B3kjbFQig"
+RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-west-2:YOUR_ACCOUNT_ID:runtime/YOUR_RUNTIME_ID"
 SESSION_ID = "python-session-001"
 
 client = boto3.client("bedrock-agentcore", region_name="us-west-2")
@@ -176,7 +176,7 @@ import boto3
 import json
 from concurrent.futures import ThreadPoolExecutor
 
-RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-west-2:350350805905:runtime/hermes_hermes-4B3kjbFQig"
+RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-west-2:YOUR_ACCOUNT_ID:runtime/YOUR_RUNTIME_ID"
 
 executor = ThreadPoolExecutor(max_workers=4)
 client = boto3.client("bedrock-agentcore", region_name="us-west-2")
@@ -231,7 +231,7 @@ import {
 } from "@aws-sdk/client-bedrock-agentcore";
 
 const RUNTIME_ARN =
-  "arn:aws:bedrock-agentcore:us-west-2:350350805905:runtime/hermes_hermes-4B3kjbFQig";
+  "arn:aws:bedrock-agentcore:us-west-2:YOUR_ACCOUNT_ID:runtime/YOUR_RUNTIME_ID";
 
 const client = new BedrockAgentCoreClient({ region: "us-west-2" });
 
@@ -280,7 +280,7 @@ awscurl --service bedrock-agentcore \
   -X POST \
   -H "Content-Type: application/json" \
   -d '{"prompt": "你好"}' \
-  "https://bedrock-agentcore.us-west-2.amazonaws.com/runtimes/arn%3Aaws%3Abedrock-agentcore%3Aus-west-2%3A350350805905%3Aruntime%2Fhermes_hermes-4B3kjbFQig/invocations"
+  "https://bedrock-agentcore.us-west-2.amazonaws.com/runtimes/arn%3Aaws%3Abedrock-agentcore%3Aus-west-2%3AYOUR_ACCOUNT_ID%3Aruntime%2FYOUR_RUNTIME_ID/invocations"
 ```
 
 ---

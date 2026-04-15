@@ -33,6 +33,7 @@ package-lock.json
 
 # AgentCore CLI state, logs & CDK build artifacts
 agentcore/.cli/
+agentcore/aws-targets.json
 agentcore/cdk/node_modules/
 agentcore/cdk/package-lock.json
 agentcore/cdk/cdk.out/

@@ -44,6 +44,10 @@ class HermesSecurityStack(Stack):
             "slack-bot-token",
             "slack-signing-secret",
             "discord-bot-token",
+            "discord-public-key",
+            "feishu-app-id",
+            "feishu-app-secret",
+            "feishu-encrypt-key",
             "openai-api-key",
             "openrouter-api-key",
         ]

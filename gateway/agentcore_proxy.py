@@ -21,7 +21,13 @@ import time
 
 import boto3
 from botocore.config import Config as BotoConfig
-from botocore.exceptions import ClientError, ReadTimeoutError
+from botocore.exceptions import (
+    ClientError,
+    ConnectionClosedError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
+from urllib3.exceptions import ProtocolError
 
 RUNTIME_ARN = os.environ.get("AGENTCORE_RUNTIME_ARN", "")
 QUALIFIER = os.environ.get("AGENTCORE_QUALIFIER", "")
@@ -90,28 +96,54 @@ class AgentCoreProxyAgent:
             "api_calls": 1,
         }
 
-    def _invoke_with_retry(self, max_retries=2, **kwargs):
+    def _invoke_with_retry(self, max_retries=3, **kwargs):
+        """Invoke AgentCore with retry logic for transient errors.
+
+        Cold starts may cause ConnectionClosedError — the microVM is booting.
+        We retry with increasing backoff (5s, 10s, 20s) to give it time.
+        """
+        _COLD_START_ERRORS = (
+            ConnectionClosedError,
+            EndpointConnectionError,
+            ReadTimeoutError,
+            ProtocolError,
+        )
+        _RETRYABLE_API_CODES = (
+            "ThrottlingException",
+            "ServiceUnavailableException",
+        )
+
         for attempt in range(max_retries + 1):
             try:
                 response = _client.invoke_agent_runtime(**kwargs)
                 return _parse_response(response)
-            except ReadTimeoutError as e:
+            except _COLD_START_ERRORS as e:
+                err_name = type(e).__name__
                 if attempt < max_retries:
-                    wait = 2 ** attempt
-                    logger.warning("AgentCore ReadTimeout (attempt %d/%d), retrying in %ds", attempt + 1, max_retries + 1, wait)
+                    wait = 5 * (2 ** attempt)  # 5s, 10s, 20s
+                    logger.warning(
+                        "AgentCore %s (attempt %d/%d) — likely cold start, retrying in %ds",
+                        err_name, attempt + 1, max_retries + 1, wait,
+                    )
                     time.sleep(wait)
                     continue
-                logger.error("AgentCore read timeout after %d attempts: %s", max_retries + 1, e)
-                return "Sorry, I encountered a timeout. The agent may be processing a complex request. Please try again."
+                logger.error("AgentCore %s after %d attempts: %s", err_name, max_retries + 1, e)
+                return "Sorry, the agent is still starting up. Please try again in a moment."
             except ClientError as e:
                 code = e.response["Error"]["Code"]
-                if code in ("ThrottlingException", "ServiceUnavailableException") and attempt < max_retries:
+                if code in _RETRYABLE_API_CODES and attempt < max_retries:
                     wait = 2 ** attempt
-                    logger.warning("AgentCore %s (attempt %d/%d), retrying in %ds", code, attempt + 1, max_retries + 1, wait)
+                    logger.warning(
+                        "AgentCore %s (attempt %d/%d), retrying in %ds",
+                        code, attempt + 1, max_retries + 1, wait,
+                    )
                     time.sleep(wait)
                     continue
                 logger.error("AgentCore invocation failed: %s", e)
                 return "Sorry, the service is temporarily busy. Please try again."
+            except Exception as e:
+                logger.error("AgentCore unexpected error: %s: %s", type(e).__name__, e)
+                return "Sorry, an unexpected error occurred. Please try again."
         return "Sorry, the service is temporarily busy. Please try again."
 
     # Attributes the gateway may read on the agent instance — safe defaults.

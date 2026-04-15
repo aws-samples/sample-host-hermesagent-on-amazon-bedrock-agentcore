@@ -1,676 +1,780 @@
-# ECS Fargate 统一网关方案：微信 + 飞书 → AgentCore
+# ECS Fargate Gateway: WeChat + Feishu (Optional Phase 4)
 
-> **状态**: 设计方案（未实现）
-> **日期**: 2026-04-14
-> **目标**: 为微信（iLink 个人微信）和飞书/Lark 添加持久连接网关，复用现有 AgentCore 后端
-
----
-
-## 1. 问题背景
-
-当前架构使用 **Router Lambda + API Gateway** 接收 webhook 并转发到 AgentCore。这对 Telegram、Discord、Slack 等 webhook 推送模式的平台工作良好，但无法支持：
-
-| 平台 | 连接模式 | 为什么 Lambda 不够 |
-|------|---------|-------------------|
-| **微信 iLink** | Long-poll（客户端主动拉取，35s 超时循环） | Lambda 最长 15 分钟，且无法维持常驻循环 |
-| **飞书/Lark** | WebSocket（持久双向连接，默认模式） | Lambda 无法保持 WebSocket 长连接 |
-
-两者都需要一个**常驻进程**来维持与平台的连接。
-
-### 微信 iLink 的特殊限制
-
-微信 iLink 是**个人微信**协议，不是企业微信：
-
-- **1:1 绑定**: 一个 QR 扫码 = 一个微信账号 = 只能与扫码者 1:1 通信
-- **不是多用户 Bot**: 不像 Telegram/Discord Bot 那样一个 token 服务所有人
-- **Token 过期**: `bot_token` 会过期（`errcode=-14`），需要重新扫码
-- **仅私聊**: `chat_type_routes()` 只返回 `("weixin_dm", ConversationKind::Private)`
-
-**多人微信方案**: 每个用户需要独立的微信 iLink 实例（独立 QR 登录、独立 token、独立 long-poll 循环）。网关需要管理多个并发实例。
-
-### 飞书/Lark 的优势
-
-飞书天然支持多用户：
-
-- **一个 Bot 服务所有人**: App ID + App Secret 创建一个 bot，所有授权用户都可以使用
-- **WebSocket 默认模式**: `FEISHU_CONNECTION_MODE=websocket`，无需公网入站端口
-- **也支持 Webhook**: 可选 `webhook` 模式，与 Lambda 兼容（但 WebSocket 更简单）
+> **Status**: Implemented (CDK + container code ready, pending deployment)
+> **Updated**: 2026-04-15
+> **Approach**: Run hermes-agent's native gateway on ECS; agent execution remains on AgentCore microVMs
 
 ---
 
-## 2. 整体架构
+## 1. Overview
+
+```
+  WeChat iLink (long-poll)  ──┐
+                               ├──►  ECS Fargate                    ──►  AgentCore microVM
+  Feishu/Lark (WebSocket)   ──┘     hermes-agent gateway                 hermes-agent (AI)
+                                    (protocol only, no AI logic)          (per-user isolation)
+```
+
+- **Gateway (ECS)**: Runs hermes-agent's native gateway module — handles WeChat long-poll and Feishu WebSocket protocols
+- **Agent (AgentCore)**: Existing AgentCore deployment unchanged — per-user Firecracker microVM isolation
+- **Bridge**: Monkey-patch `AIAgent` → `AgentCoreProxyAgent`, converting `run_conversation()` calls into `invoke_agent_runtime()` API calls
+
+### Why reuse hermes-agent's native gateway
+
+| Dimension | Custom thin gateway | **Reuse hermes-agent gateway** |
+|-----------|--------------------|---------------------------------|
+| WeChat protocol code | Rewrite ~1,800 lines | **0 lines** (use `weixin.py` as-is) |
+| Feishu protocol code | Rewrite ~3,950 lines | **0 lines** (use `feishu.py` as-is) |
+| Features | Message forwarding only | Typing indicators, media encryption, message splitting, dedup, group policies |
+| Maintenance | Must track upstream protocol changes | `git pull` to sync upstream |
+| New code required | ~2,000 lines | **~100 lines** (proxy agent only) |
+
+---
+
+## 2. Architecture
 
 ```
   ┌────────────────────────────────────────────────────────────┐
-  │                     用户入口                                │
+  │                      User Channels                          │
   │                                                            │
-  │  Telegram  Discord  Slack     微信 iLink      飞书/Lark    │
-  │  (webhook) (webhook) (webhook)  (long-poll)   (WebSocket)  │
+  │  Telegram  Discord  Slack       WeChat iLink   Feishu/Lark │
+  │  (webhook) (webhook) (webhook)  (long-poll)    (WebSocket)  │
   └─────┬────────┬───────┬──────────────┬──────────────┬───────┘
         │        │       │              │              │
-        │   Webhook 模式  │        持久连接模式         │
-        │   (现有架构)     │        (新增)              │
+        │   Existing Phase 1-3          │   New Phase 4
         ▼        ▼       ▼              ▼              ▼
-  ┌──────────────────┐    ┌─────────────────────────────────┐
-  │  API Gateway     │    │  ECS Fargate 统一网关            │
-  │  + Router Lambda │    │  (常驻运行)                      │
-  │  (无状态)         │    │                                 │
-  │                  │    │  ┌──────────┐  ┌──────────────┐ │
-  │  /webhook/tg     │    │  │ 微信      │  │ 飞书          │ │
-  │  /webhook/slack  │    │  │ Adapter  │  │ Adapter      │ │
-  │  /webhook/discord│    │  │ × N 实例  │  │ (单实例)      │ │
-  │                  │    │  └────┬─────┘  └──────┬───────┘ │
-  └────────┬─────────┘    │       └───────┬───────┘         │
-           │              │               │                 │
-           │              │       ┌───────▼──────────┐      │
-           │              │       │  AgentCore       │      │
-           │              │       │  Dispatcher      │      │
-           │              │       │  (boto3 调用)     │      │
-           │              │       └───────┬──────────┘      │
-           │              └───────────────┼─────────────────┘
-           │                              │
-           ▼                              ▼
-  ┌──────────────────────────────────────────────────────────┐
-  │          invoke_agent_runtime()                           │
-  │          (agentRuntimeArn, runtimeSessionId,              │
-  │           runtimeUserId, payload)                         │
-  └─────────────────────────┬────────────────────────────────┘
-                            │
-  ┌─────────────────────────▼────────────────────────────────┐
-  │              Amazon Bedrock AgentCore                      │
-  │                                                           │
-  │   Per-User Firecracker MicroVM                            │
-  │   ┌─────────────────────────────────────────────────┐    │
-  │   │  Contract Server → hermes-agent (40+ tools)      │    │
-  │   │  Bedrock Claude (SigV4 auth)                     │    │
-  │   │  /mnt/workspace/.hermes/ (S3 sync)               │    │
-  │   └─────────────────────────────────────────────────┘    │
-  └───────────────────────────────────────────────────────────┘
+  ┌──────────────────┐    ┌─────────────────────────────────────┐
+  │  API Gateway     │    │  ECS Fargate                         │
+  │  + Router Lambda │    │  hermes-agent gateway                │
+  │                  │    │                                      │
+  │                  │    │  ┌──────────┐  ┌──────────────────┐ │
+  │                  │    │  │ weixin.py │  │ feishu.py        │ │
+  │                  │    │  │ long-poll │  │ WebSocket        │ │
+  │                  │    │  └─────┬────┘  └──────┬───────────┘ │
+  │                  │    │        └──────┬───────┘             │
+  │                  │    │               ▼                     │
+  │                  │    │  ┌──────────────────────────────┐   │
+  │                  │    │  │ AgentCoreProxyAgent          │   │
+  │                  │    │  │ (monkey-patch replaces       │   │
+  │                  │    │  │  AIAgent)                    │   │
+  │                  │    │  │                              │   │
+  │                  │    │  │ run_conversation(msg)        │   │
+  │                  │    │  │   → invoke_agent_runtime()   │   │
+  │                  │    │  │   → parse SSE response       │   │
+  │                  │    │  └──────────────┬───────────────┘   │
+  └────────┬─────────┘    └────────────────┼───────────────────┘
+           │                               │
+           ▼                               ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │                invoke_agent_runtime()                         │
+  │                (agentRuntimeArn, sessionId, userId, payload)  │
+  └──────────────────────────┬───────────────────────────────────┘
+                             │
+  ┌──────────────────────────▼───────────────────────────────────┐
+  │                Amazon Bedrock AgentCore                       │
+  │                                                               │
+  │   Per-User Firecracker microVM                                │
+  │   ┌─────────────────────────────────────────────────────┐    │
+  │   │  contract.py → hermes-agent AIAgent (40+ tools)      │    │
+  │   │  Monkey-patch → AnthropicBedrock (SigV4)             │    │
+  │   │  /mnt/workspace/.hermes/ (S3 sync)                   │    │
+  │   └─────────────────────────────────────────────────────┘    │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-**核心原则**: ECS 网关只负责**平台协议适配**（维持连接、收发消息），所有 AI 推理和工具执行仍然在 AgentCore microVM 中完成。网关是一个薄转发层。
+**Both paths share the same AgentCore Runtime**:
+- Telegram/Slack/Discord → Lambda → `invoke_agent_runtime()`
+- WeChat/Feishu → ECS gateway → `invoke_agent_runtime()`
 
 ---
 
-## 3. 组件设计
+## 3. Core Component: AgentCoreProxyAgent
 
-### 3.1 AgentCore Dispatcher（核心转发模块）
-
-网关的核心：接收来自微信/飞书的消息，调用 `invoke_agent_runtime()`，返回响应。
-
-```
-输入:
-  - platform: "weixin" | "feishu"
-  - actor_id: 平台用户标识 (微信 from_user_id / 飞书 open_id)
-  - chat_id: 会话标识
-  - text: 消息文本
-  - media: 可选的媒体附件
-
-处理:
-  1. actor_id → DynamoDB 查询身份 (复用现有 identity table)
-  2. 构造 session_id = f"{platform}:{actor_id}:{chat_id}"
-  3. 构造 payload = {"action": "chat", "message": text, "channel": platform}
-  4. 调用 invoke_agent_runtime(
-       agentRuntimeArn=RUNTIME_ARN,
-       runtimeSessionId=session_id,
-       runtimeUserId=actor_id,
-       payload=payload
-     )
-  5. 解析 SSE 响应 (data: "..." 格式)
-
-输出:
-  - 文本响应 → 返回给平台 adapter 发送
-```
-
-这与 Router Lambda 中的 `_invoke_agentcore()` 函数逻辑一致，只是运行环境从 Lambda 变成 ECS。
-
-### 3.2 微信 Adapter
-
-管理多个微信 iLink 实例，每个实例对应一个扫码用户。
-
-```
-┌──────────────────────────────────────────────────────┐
-│  微信 Adapter Manager                                 │
-│                                                       │
-│  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐ │
-│  │ 实例 A       │  │ 实例 B       │  │ 实例 C      │ │
-│  │ account: wx1 │  │ account: wx2 │  │ account: wx3│ │
-│  │ token: t1    │  │ token: t2    │  │ token: t3   │ │
-│  │ long-poll ↻  │  │ long-poll ↻  │  │ long-poll ↻ │ │
-│  │ user: Alice  │  │ user: Bob    │  │ user: Carol │ │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬──────┘ │
-│         └─────────────┬───┴─────────────────┘        │
-│                       ▼                               │
-│              AgentCore Dispatcher                     │
-└──────────────────────────────────────────────────────┘
-```
-
-**实例生命周期**:
-
-| 阶段 | 说明 |
-|------|------|
-| 注册 | 管理员通过 Web API 触发 QR 登录，获取 account_id + bot_token |
-| 持久化 | 凭证加密存储到 Secrets Manager: `hermes/weixin/{account_id}` |
-| 启动 | 网关启动时从 Secrets Manager 加载所有注册账号，启动 long-poll 循环 |
-| 运行 | 每个实例独立 long-poll，收到消息后通过 Dispatcher 转发到 AgentCore |
-| 过期 | `errcode=-14` 触发 token 过期告警 → CloudWatch Alarm → 通知管理员重新扫码 |
-| 重新登录 | 通过 Web API 发起新的 QR 登录流程，更新 Secrets Manager |
-
-**QR 登录流程**:
-
-```
-管理员                    ECS 网关                    微信 iLink API
-  │                          │                            │
-  │  POST /admin/weixin/qr   │                            │
-  │ ────────────────────────► │                            │
-  │                          │  GET get_bot_qrcode        │
-  │                          │ ──────────────────────────► │
-  │                          │ ◄────── qrcode_img_content  │
-  │  ◄──── QR image URL      │                            │
-  │                          │                            │
-  │  (微信扫码)               │  poll get_qrcode_status    │
-  │                          │ ──────────────────────────► │
-  │                          │ ◄────── status: confirmed   │
-  │                          │         bot_token, base_url │
-  │                          │                            │
-  │                          │  保存到 Secrets Manager     │
-  │                          │  启动 long-poll 实例        │
-  │  ◄──── 连接成功           │                            │
-```
-
-### 3.3 飞书 Adapter
-
-单实例，通过 WebSocket 服务所有授权用户。
-
-```
-┌──────────────────────────────────────────────────────┐
-│  飞书 Adapter                                         │
-│                                                       │
-│  ┌────────────────────────────────────┐               │
-│  │ WebSocket Client (lark-oapi)       │               │
-│  │ App ID: cli_xxx                    │               │
-│  │ App Secret: ***                    │               │
-│  │ 自动重连 + Ping/Pong keepalive     │               │
-│  └──────────────┬─────────────────────┘               │
-│                 │                                      │
-│  收到消息 → 解析 event → 提取 open_id + text           │
-│                 │                                      │
-│                 ▼                                      │
-│        AgentCore Dispatcher                           │
-│        (session_id = feishu:{open_id}:{chat_id})      │
-└──────────────────────────────────────────────────────┘
-```
-
-**飞书多用户路由**:
-- DM: `session_id = feishu:{open_id}:dm` → AgentCore 按 user 隔离
-- 群聊: `session_id = feishu:{open_id}:{chat_id}` → 按群 + 用户隔离
-- allowlist 通过 DynamoDB identity table 检查: `ALLOW#feishu:{open_id}`
-
-### 3.4 管理 API
-
-ECS 网关提供一个内部 HTTP API（仅通过 ALB 内网访问或 API Gateway 鉴权）：
-
-| Endpoint | Method | 说明 |
-|----------|--------|------|
-| `/admin/health` | GET | 网关健康状态、各 adapter 连接状态 |
-| `/admin/weixin/accounts` | GET | 列出所有微信实例及状态 |
-| `/admin/weixin/qr` | POST | 发起新的 QR 登录流程 |
-| `/admin/weixin/qr/{id}/status` | GET | 轮询 QR 扫码状态 |
-| `/admin/weixin/{account_id}` | DELETE | 移除微信实例 |
-| `/admin/feishu/status` | GET | 飞书连接状态 |
-
-管理 API 可选接入现有 Web UI Dashboard（hermes-agent v0.9.0 新增的 Web Dashboard）。
-
----
-
-## 4. 身份与权限模型
-
-### 4.1 复用现有 DynamoDB Identity Table
-
-```
-现有 (Router Lambda 使用):
-  PK: ALLOW#telegram:{user_id}     SK: ALLOW
-  PK: ALLOW#discord:{user_id}      SK: ALLOW
-
-新增:
-  PK: ALLOW#weixin:{from_user_id}  SK: ALLOW
-  PK: ALLOW#feishu:{open_id}       SK: ALLOW
-```
-
-ECS 网关和 Router Lambda 共享同一张 `hermes-agentcore-identity` 表，统一权限管理。
-
-### 4.2 微信的特殊身份映射
-
-微信 iLink 的 `from_user_id` 是平台分配的不透明 ID，不是微信号。管理员在 QR 登录时需要记录：
-
-```
-# 微信账号元数据 (Secrets Manager)
-hermes/weixin/{account_id}:
-{
-  "bot_token": "xxx",
-  "base_url": "https://ilinkai.weixin.qq.com",
-  "user_id": "ilink_user_xxx",        # 扫码者的 ilink_user_id
-  "owner_name": "Alice",               # 管理员备注
-  "registered_at": "2026-04-14T10:00:00Z"
-}
-
-# DynamoDB allowlist
-PK: ALLOW#weixin:{from_user_id}  SK: ALLOW
-  userId: weixin:{from_user_id}
-  platform: weixin
-  weixinAccountId: {account_id}       # 关联到哪个微信实例
-```
-
-### 4.3 Session ID 映射到 AgentCore
+The hermes-agent gateway calls `agent.run_conversation(message)` at `gateway/run.py:8097`. We monkey-patch `AIAgent` with a proxy that forwards the call to AgentCore.
 
 ```python
-# 微信: 每个微信实例本身就是1:1，session_id 直接用 account_id
-session_id = f"weixin:{account_id}:dm"
+# agentcore_proxy.py (~100 lines)
 
-# 飞书 DM: 一个 bot 多个用户，按 open_id 隔离
-session_id = f"feishu:{open_id}:dm"
+import json, os, time, logging, boto3
+from botocore.exceptions import ClientError
 
-# 飞书群聊: 按群 + 用户隔离
-session_id = f"feishu:{open_id}:{chat_id}"
+RUNTIME_ARN = os.environ["AGENTCORE_RUNTIME_ARN"]
+QUALIFIER = os.environ.get("AGENTCORE_QUALIFIER", "")
+
+_client = boto3.client("bedrock-agentcore", region_name=os.environ.get("AWS_REGION", "us-west-2"))
+logger = logging.getLogger("agentcore_proxy")
+
+
+class AgentCoreProxyAgent:
+    """Drop-in replacement for AIAgent — forwards to AgentCore."""
+
+    def __init__(self, *, session_id="", platform="", user_id="", **kwargs):
+        # Ignore AIAgent's other params (model, tools, etc.)
+        # Those are handled by the real AIAgent inside AgentCore.
+        self.session_id = session_id
+        self.platform = platform
+        self.user_id = user_id
+
+        # AgentCore session_id must be >= 33 characters
+        self._ac_session_id = f"{platform}__{user_id}__{session_id}"
+        if len(self._ac_session_id) < 33:
+            self._ac_session_id += ":" + "0" * (33 - len(self._ac_session_id) - 1)
+        self._ac_session_id = self._ac_session_id[:128]
+        self._ac_user_id = f"{platform}:{user_id}"
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        """Call invoke_agent_runtime() and return an AIAgent-compatible result dict."""
+        payload = json.dumps({
+            "action": "chat",
+            "message": message,
+            "userId": self._ac_user_id,
+            "channel": self.platform,
+        })
+
+        kwargs = {
+            "agentRuntimeArn": RUNTIME_ARN,
+            "runtimeSessionId": self._ac_session_id,
+            "runtimeUserId": self._ac_user_id,
+            "payload": payload,
+        }
+        if QUALIFIER:
+            kwargs["qualifier"] = QUALIFIER
+
+        text = self._invoke_with_retry(**kwargs)
+
+        return {
+            "final_response": text,
+            "messages": [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": text},
+            ],
+            "api_calls": 1,
+        }
+
+    def _invoke_with_retry(self, max_retries=2, **kwargs):
+        for attempt in range(max_retries + 1):
+            try:
+                response = _client.invoke_agent_runtime(**kwargs)
+                return _parse_sse_response(response)
+            except ClientError as e:
+                code = e.response["Error"]["Code"]
+                if code in ("ThrottlingException", "ServiceUnavailableException") and attempt < max_retries:
+                    time.sleep(2 ** attempt)
+                    continue
+                logger.error("AgentCore invocation failed: %s", e)
+                return "Sorry, the service is temporarily busy. Please try again."
+        return "Sorry, the service is temporarily busy. Please try again."
+
+    # Attributes the gateway may access — safe defaults
+    context_compressor = None
+    session_prompt_tokens = 0
+    session_completion_tokens = 0
+    model = "agentcore-proxy"
+    tools = []
+
+
+def _parse_sse_response(response):
+    """Parse AgentCore SSE response (data: "..." format)."""
+    chunks = []
+    result = response.get("response", "")
+    if hasattr(result, "read"):
+        result = result.read()
+    if isinstance(result, bytes):
+        result = result.decode("utf-8")
+    result = result.strip()
+    if result.startswith("data: "):
+        result = result[6:]
+    if result.startswith('"') and result.endswith('"'):
+        try:
+            result = json.loads(result)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return result
+
+
+def patch_aiagent():
+    """Call before gateway starts — replaces AIAgent with AgentCore proxy."""
+    import run_agent
+    run_agent.AIAgent = AgentCoreProxyAgent
 ```
 
-AgentCore 会为每个唯一的 `runtimeSessionId` 分配独立的 microVM，确保用户隔离。
+### Entry point
+
+```python
+# main.py (ECS container entry)
+from agentcore_proxy import patch_aiagent
+patch_aiagent()
+
+# Start hermes-agent gateway normally
+from gateway.run import start_gateway
+start_gateway()
+```
+
+The gateway code requires **zero modifications** — when it calls `AIAgent(session_id=..., platform=...)`, it gets an `AgentCoreProxyAgent` instead, and `run_conversation()` is transparently forwarded to AgentCore.
 
 ---
 
-## 5. AWS 基础设施
+## 4. Message Flow
 
-### 5.1 新增资源（CDK Phase 4）
-
-```
-┌──────────────────────────────────────────────────────────┐
-│  hermes-agentcore-gateway (新增 CDK Stack)                │
-│                                                           │
-│  ┌────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ ECS Cluster │  │ Fargate      │  │ CloudWatch       │  │
-│  │ (使用现有   │  │ Service      │  │ Log Group        │  │
-│  │  VPC)       │  │ desiredCount │  │ /ecs/hermes-     │  │
-│  │             │  │   = 1        │  │  gateway         │  │
-│  └──────┬──────┘  └──────┬───────┘  └──────────────────┘  │
-│         │                │                                 │
-│  ┌──────▼────────────────▼────────┐                       │
-│  │ Fargate Task Definition        │                       │
-│  │ CPU: 512   Memory: 1024       │                       │
-│  │ Platform: LINUX/ARM64         │                       │
-│  │ (Graviton, 与 AgentCore 一致)  │                       │
-│  │                                │                       │
-│  │ Container: hermes-gateway      │                       │
-│  │   Image: ECR (同一 registry)   │                       │
-│  │   Port: 8080 (admin API)       │                       │
-│  │                                │                       │
-│  │ Environment:                   │                       │
-│  │   AGENTCORE_RUNTIME_ARN        │                       │
-│  │   IDENTITY_TABLE               │                       │
-│  │   WEIXIN_SECRETS_PREFIX        │                       │
-│  │   FEISHU_APP_ID                │                       │
-│  │   FEISHU_APP_SECRET (from SM)  │                       │
-│  └────────────────────────────────┘                       │
-│                                                           │
-│  IAM Role (Task Role):                                    │
-│  - bedrock-agentcore:InvokeAgentRuntime                   │
-│  - bedrock-agentcore:InvokeAgentRuntimeForUser            │
-│  - dynamodb:Query/GetItem (identity table)                │
-│  - secretsmanager:GetSecretValue (hermes/weixin/*)        │
-│  - secretsmanager:PutSecretValue (hermes/weixin/*)        │
-│  - logs:CreateLogStream/PutLogEvents                      │
-└──────────────────────────────────────────────────────────┘
-```
-
-### 5.2 网络架构
+### 4.1 WeChat
 
 ```
-┌─────────────────── VPC (复用 Phase 1) ───────────────────┐
+WeChat User Alice        ECS Gateway                     AgentCore microVM
+    │                        │                               │
+    │  Send "Hello"          │                               │
+    │                        │                               │
+    │                  weixin.py long-poll:                   │
+    │                  getupdates → receive message           │
+    │                  parse from_user_id, text               │
+    │                  send typing indicator                  │
+    │                        │                               │
+    │                  AgentCoreProxyAgent                    │
+    │                  .run_conversation("Hello")             │
+    │                        │                               │
+    │                        │  invoke_agent_runtime(         │
+    │                        │    ARN, sessionId, userId,     │
+    │                        │    {action:"chat", message})   │
+    │                        │ ─────────────────────────────► │
+    │                        │                               │
+    │                        │         hermes-agent executes  │
+    │                        │         Bedrock Claude LLM     │
+    │                        │         tool calls, memory     │
+    │                        │                               │
+    │                        │ ◄──── SSE response             │
+    │                        │                               │
+    │                  parse response                         │
+    │                  weixin.py sendmessage()                │
+    │                  (context_token, message splitting)     │
+    │  ◄── receive reply     │                               │
+```
+
+### 4.2 Feishu
+
+```
+Feishu User Bob          ECS Gateway                     AgentCore microVM
+    │                        │                               │
+    │  @bot Hello            │                               │
+    │                        │                               │
+    │                  feishu.py WebSocket:                   │
+    │                  receive im.message.receive_v1         │
+    │                  parse open_id, chat_id, text          │
+    │                  check group policy                    │
+    │                        │                               │
+    │                  AgentCoreProxyAgent                    │
+    │                  .run_conversation("Hello")             │
+    │                        │                               │
+    │                        │  invoke_agent_runtime()        │
+    │                        │ ─────────────────────────────► │
+    │                        │ ◄──── SSE response             │
+    │                        │                               │
+    │                  feishu.py send rich text message       │
+    │  ◄── receive reply     │                               │
+```
+
+### 4.3 Comparison with Lambda path
+
+```
+Lambda path (Telegram, etc.):
+  webhook → Lambda handler → _invoke_agentcore() → AgentCore
+  (Lambda implements message parsing and response delivery)
+
+ECS Gateway path (WeChat, Feishu):
+  platform → hermes-agent adapter → AgentCoreProxyAgent.run_conversation() → AgentCore
+  (hermes-agent's native adapter handles all platform protocol)
+```
+
+Both paths call the same `invoke_agent_runtime()` API and share the same AgentCore Runtime.
+
+---
+
+## 5. Container Design
+
+### 5.1 Dockerfile
+
+```dockerfile
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git libsqlite3-0 ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install hermes-agent (gateway module requires full install)
+COPY hermes-agent/ /app/hermes-agent/
+RUN pip install --no-cache-dir /app/hermes-agent[cron,mcp]
+
+# Feishu SDK + WeChat dependencies
+RUN pip install --no-cache-dir lark-oapi aiohttp cryptography
+
+# AgentCore invocation
+RUN pip install --no-cache-dir boto3
+
+# Proxy agent bridge
+COPY agentcore_proxy.py /app/agentcore_proxy.py
+COPY main.py /app/main.py
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app:/app/hermes-agent
+ENV HERMES_HOME=/opt/data
+ENV HERMES_HEADLESS=1
+
+CMD ["python", "/app/main.py"]
+```
+
+**Note**: Although AI inference runs in AgentCore, hermes-agent must be fully installed because the gateway module has import dependencies on the agent module. No LLM calls are made from the ECS container.
+
+### 5.2 Process Model
+
+```
+main.py
+  │
+  ├── patch_aiagent()  ← monkey-patch AIAgent → AgentCoreProxyAgent
+  │
+  └── start_gateway()  ← hermes-agent native gateway startup
+        │
+        ├── WeixinAdapter (if WEIXIN_TOKEN is set)
+        │     └── Long-poll loop (35s timeout)
+        │
+        ├── FeishuAdapter (if FEISHU_APP_ID is set)
+        │     └── WebSocket client (lark-oapi SDK, auto-reconnect)
+        │
+        └── On message → AgentCoreProxyAgent.run_conversation()
+                           → boto3 invoke_agent_runtime()
+                           → AgentCore microVM executes
+                           → return response → adapter sends
+```
+
+---
+
+## 6. Configuration
+
+### 6.1 Environment Variables
+
+**Required:**
+
+| Variable | Description |
+|----------|-------------|
+| `AGENTCORE_RUNTIME_ARN` | AgentCore Runtime ARN (same as Phase 3) |
+| `AGENTCORE_QUALIFIER` | AgentCore Qualifier (optional) |
+| `AWS_REGION` | AWS region |
+
+**WeChat (enable on demand):**
+
+| Variable | Description |
+|----------|-------------|
+| `WEIXIN_ACCOUNT_ID` | WeChat iLink account identifier |
+| `WEIXIN_TOKEN` | iLink bot_token (injected from Secrets Manager) |
+| `WEIXIN_DM_POLICY` | `open` (default) or `disabled` |
+| `WEIXIN_ALLOWED_USERS` | Authorized user IDs (comma-separated) |
+
+**Feishu (enable on demand):**
+
+| Variable | Description |
+|----------|-------------|
+| `FEISHU_APP_ID` | Feishu application ID |
+| `FEISHU_APP_SECRET` | Feishu app secret (injected from Secrets Manager) |
+| `FEISHU_CONNECTION_MODE` | `websocket` (default) or `webhook` |
+| `FEISHU_DOMAIN` | `feishu` (default) or `lark` (international) |
+| `FEISHU_GROUP_POLICY` | `open` / `allowlist` / `disabled` |
+
+**General:**
+
+| Variable | Description |
+|----------|-------------|
+| `HERMES_HOME` | Data directory (default `/opt/data`) |
+| `HERMES_HEADLESS` | `1` (non-interactive mode) |
+| `GATEWAY_ALLOW_ALL_USERS` | `true` / `false` |
+
+### 6.2 Secrets Manager
+
+```
+hermes/weixin/token          # WeChat iLink bot_token
+hermes/feishu/app-secret     # Feishu App Secret
+```
+
+Reuses Secrets Manager from Phase 1. Injected via ECS Task Definition `secrets` field — credentials never touch disk.
+
+---
+
+## 7. AWS Infrastructure
+
+### 7.1 CDK Stack (Phase 4)
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  hermes-agentcore-gateway (new CDK Stack)                     │
+│                                                               │
+│  ┌─────────────┐  ┌────────────────┐  ┌───────────────────┐  │
+│  │ ECS Cluster  │  │ Fargate Service │  │ CloudWatch        │  │
+│  │ (reuse VPC)  │  │ desiredCount=1  │  │ Log Group         │  │
+│  └──────┬───────┘  └───────┬────────┘  └───────────────────┘  │
+│         │                  │                                   │
+│  ┌──────▼──────────────────▼──────────┐                       │
+│  │ Task Definition                    │                       │
+│  │ CPU: 512  Memory: 1024            │                       │
+│  │ Platform: LINUX/ARM64 (Graviton)   │                       │
+│  │                                    │                       │
+│  │ Container: hermes-gateway          │                       │
+│  │   Image: ECR                       │                       │
+│  │   Port: 8080 (health check)       │                       │
+│  │                                    │                       │
+│  │ Environment:                       │                       │
+│  │   AGENTCORE_RUNTIME_ARN            │                       │
+│  │   HERMES_HOME, HERMES_HEADLESS     │                       │
+│  │                                    │                       │
+│  │ Secrets (from Secrets Manager):    │                       │
+│  │   WEIXIN_TOKEN, FEISHU_APP_SECRET  │                       │
+│  └────────────────────────────────────┘                       │
+│                                                               │
+│  IAM Task Role:                                               │
+│  - bedrock-agentcore:InvokeAgentRuntime (scoped to ARN)       │
+│  - secretsmanager:GetSecretValue (hermes/weixin/*, feishu/*)  │
+│  - logs:CreateLogStream, logs:PutLogEvents                    │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Note**: The gateway does NOT need `bedrock:InvokeModel` — LLM calls are made by the AgentCore container, not the gateway.
+
+### 7.2 Networking
+
+```
+┌─────────────────── VPC (reuse Phase 1) ──────────────────┐
 │                                                           │
-│  Private Subnet A           Private Subnet B              │
-│  ┌─────────────────┐       ┌─────────────────┐           │
-│  │ Fargate Task    │       │ (备用 AZ)        │           │
-│  │ hermes-gateway  │       │                  │           │
-│  │                 │       │                  │           │
-│  │ ← 只需出站连接   │       │                  │           │
-│  │   无入站端口     │       │                  │           │
-│  └────────┬────────┘       └──────────────────┘           │
-│           │                                               │
-│           ▼                                               │
-│  ┌─────────────────┐                                     │
-│  │  NAT Gateway    │  → 微信 iLink API (HTTPS 出站)       │
-│  │  (复用现有)      │  → 飞书 WebSocket (WSS 出站)         │
-│  │                 │  → AgentCore API (内网 VPC Endpoint)  │
-│  └─────────────────┘                                     │
+│  Private Subnet                                           │
+│  ┌─────────────────────┐                                  │
+│  │ Fargate Task         │                                  │
+│  │ hermes-agent gateway │                                  │
+│  │                      │                                  │
+│  │ Outbound only:       │                                  │
+│  │  → WeChat iLink API  (HTTPS via NAT)                   │
+│  │  → Feishu WebSocket   (WSS via NAT)                    │
+│  │  → AgentCore API      (VPC Endpoint, bypasses NAT)     │
+│  │  → Secrets Manager    (VPC Endpoint)                   │
+│  │                      │                                  │
+│  │ No inbound ports     │                                  │
+│  └──────────────────────┘                                  │
 │                                                           │
-│  可选: VPC Endpoint for bedrock-agentcore                 │
-│        (避免 AgentCore 调用走 NAT)                         │
+│  NAT Gateway (reuse) → external outbound                  │
+│  VPC Endpoints (reuse) → AgentCore, Secrets Manager       │
 └───────────────────────────────────────────────────────────┘
 ```
 
-**关键网络特性**:
-- **无入站端口**: 微信 long-poll 和飞书 WebSocket 都是**出站连接**
-- **不需要 ALB**: 网关不接收外部请求（管理 API 可选通过内网访问）
-- **复用现有 VPC + NAT**: 与 Phase 1 创建的基础设施共享
+**No inbound ports required**: Both WeChat long-poll and Feishu WebSocket are outbound-only connections. No ALB needed.
 
-### 5.3 与现有 Phase 的关系
+### 7.3 Relationship to Existing Phases
 
 ```
-Phase 1: VPC + Security + Guardrails + IAM          ← 复用
-Phase 2: AgentCore Runtime + Container Build         ← 复用（同一个 runtime）
-Phase 3: Router Lambda + API GW + DynamoDB + Cron    ← 复用（共享 DynamoDB）
-Phase 4: ECS Gateway for WeChat + Feishu             ← 新增
+Phase 1: VPC + Security + Guardrails + IAM          ← reuse VPC, Secrets Manager
+Phase 2: AgentCore Runtime + Container Build         ← reuse (same Runtime)
+Phase 3: Router Lambda + API GW + DynamoDB + Cron    ← unchanged
+Phase 4: ECS Gateway (WeChat + Feishu)               ← new (optional)
 ```
 
-Phase 4 是增量部署，不修改任何现有资源。
+Phase 4 is an incremental, optional deployment. It depends on Phase 1 (VPC) and Phase 2 (Runtime ARN).
+
+### 7.4 What the Gateway Does NOT Need
+
+| Resource | Lambda Router (Phase 3) | ECS Gateway (Phase 4) | Why |
+|----------|------------------------|----------------------|-----|
+| API Gateway | Required | **Not needed** | No webhook ingress |
+| ALB | — | **Not needed** | No inbound ports |
+| DynamoDB | Required (identity table) | **Not needed** | hermes-agent has built-in allowlist |
+| EFS | — | **Not needed** | State lives in AgentCore microVM |
+| Bedrock permissions | Not needed | **Not needed** | LLM runs inside AgentCore |
+
+The gateway only needs: ECS + Fargate + IAM (`InvokeAgentRuntime`) + Secrets Manager read.
 
 ---
 
-## 6. 容器设计
+## 8. Persistence
 
-### 6.1 Dockerfile
+### 8.1 The Gateway Is Stateless
 
-```
-# 轻量级 Python 容器，只包含平台协议处理
-# 不包含完整的 hermes-agent（AI 推理在 AgentCore 中执行）
+- **Conversation history**: Stored in AgentCore microVM at `/mnt/workspace/.hermes/state.db`
+- **Memory, skills**: Same — managed by the AgentCore container
+- **Platform credentials**: Secrets Manager (injected as env vars)
 
-FROM python:3.12-slim AS gateway
+On gateway restart:
+- WeChat: Re-establishes long-poll (if token not expired)
+- Feishu: WebSocket auto-reconnects
+- User conversation context is not lost (lives in AgentCore microVM)
 
-# 最小依赖集
-# - aiohttp: 微信 iLink HTTP + 飞书 Webhook 备选
-# - lark-oapi: 飞书 SDK (WebSocket + API)
-# - websockets: 飞书 WebSocket 传输层
-# - cryptography: 微信媒体 AES 加解密
-# - boto3: AgentCore 调用 + DynamoDB + Secrets Manager
+### 8.2 Ephemeral Storage Is Sufficient
 
-COPY gateway/ /app/gateway/
-COPY requirements-gateway.txt /app/
-RUN pip install -r /app/requirements-gateway.txt
+| Content | Required? | Approach |
+|---------|-----------|----------|
+| gateway.log | Optional | CloudWatch Logs |
+| Session files | Optional | Ephemeral storage (OK to lose on restart) |
+| config.yaml | Optional | Configured via environment variables |
 
-WORKDIR /app
-CMD ["python", "-m", "gateway.main"]
-```
-
-**镜像大小目标**: < 200 MB（无 ML 库、无 Playwright、无 hermes-agent 完整依赖）
-
-### 6.2 进程模型
-
-```
-main.py (asyncio event loop)
-  │
-  ├── WeixinAdapterManager
-  │     ├── WeixinInstance("account_1")  →  asyncio.Task (long-poll loop)
-  │     ├── WeixinInstance("account_2")  →  asyncio.Task (long-poll loop)
-  │     └── ...
-  │
-  ├── FeishuAdapter
-  │     └── FeishuWSClient              →  threading.Thread (lark-oapi WS)
-  │
-  ├── AgentCoreDispatcher
-  │     └── boto3.client("bedrock-agentcore")
-  │
-  ├── AdminAPI (aiohttp server, port 8080)
-  │     └── /admin/health, /admin/weixin/*, /admin/feishu/*
-  │
-  └── HealthCheck (定期上报 CloudWatch 自定义指标)
-```
+**No EFS needed.** All gateway runtime state is rebuildable. Fargate's 20GB ephemeral storage is sufficient.
 
 ---
 
-## 7. 消息流详解
+## 9. Security Analysis
 
-### 7.1 微信消息流
+### 9.1 Threat Model
 
-```
-微信用户 Alice                ECS 网关                     AgentCore
-    │                           │                            │
-    │  发送 "你好"              │                            │
-    │  ─────(微信服务器)────►   │                            │
-    │                    getupdates 返回消息                  │
-    │                           │                            │
-    │                 提取 from_user_id, text                │
-    │                 查询 DynamoDB allowlist                │
-    │                 获取 context_token                     │
-    │                           │                            │
-    │                 session_id = weixin:acct1:dm           │
-    │                 actor_id = weixin:{from_user_id}       │
-    │                           │                            │
-    │                           │  invoke_agent_runtime()    │
-    │                           │ ──────────────────────────►│
-    │                           │                            │
-    │                           │  (AgentCore microVM 处理)  │
-    │                           │  hermes-agent 执行         │
-    │                           │  Bedrock Claude 推理       │
-    │                           │                            │
-    │                           │ ◄─── SSE response          │
-    │                           │                            │
-    │                 解析响应，发送回微信                     │
-    │                 sendmessage(context_token=...)         │
-    │  ◄───(微信服务器)────     │                            │
-    │  收到回复                 │                            │
-```
+| Threat | Severity | New risk? | Analysis |
+|--------|----------|-----------|----------|
+| **Session ID spoofing** | Medium | **No** | ECS Task Role can construct arbitrary `runtimeSessionId` — but this is the same trust level as the Lambda Router. Both rely on IAM as the trust boundary. |
+| **Payload tampering in contract.py** | Low | **No** (pre-existing) | `contract.py:128` trusts `body.userId` without validating against `runtimeSessionId`. This is an existing gap in the AgentCore container, not introduced by Phase 4. |
+| **Credential exposure** | Low | **No** | Secrets injected via Secrets Manager → ECS Task Definition `secrets` field. Same pattern as Lambda reading bot tokens. |
+| **Network attack surface** | None | **Reduced** | ECS container has outbound-only connections. No inbound ports, no ALB, no API Gateway. Smaller attack surface than existing Phase 3. |
+| **AgentCore microVM escape** | Very Low | **No** | AgentCore's Firecracker isolation is unchanged. |
 
-### 7.2 飞书消息流
+### 9.2 IAM Least-Privilege Requirements
 
-```
-飞书用户 Bob               ECS 网关                      AgentCore
-    │                          │                            │
-    │  @bot 你好               │                            │
-    │  ─(飞书 WebSocket)──►    │                            │
-    │                          │                            │
-    │                 WebSocket 回调触发                     │
-    │                 解析 event → open_id, chat_id, text   │
-    │                 查询 DynamoDB allowlist               │
-    │                          │                            │
-    │                 session_id = feishu:{open_id}:dm      │
-    │                 actor_id = feishu:{open_id}           │
-    │                          │                            │
-    │                          │  invoke_agent_runtime()    │
-    │                          │ ─────────────────────────► │
-    │                          │                            │
-    │                          │ ◄─── SSE response          │
-    │                          │                            │
-    │                 通过 lark-oapi 发送富文本消息           │
-    │  ◄──(飞书 WebSocket)──   │                            │
-    │  收到回复                │                            │
-```
-
----
-
-## 8. 错误处理与可靠性
-
-### 8.1 微信 Token 过期处理
-
-```
-getupdates 返回 errcode=-14
-        │
-        ▼
-  暂停该实例 long-poll
-        │
-  发送 CloudWatch Custom Metric:
-    WeixinTokenExpired = 1
-    Dimensions: {account_id}
-        │
-  触发 CloudWatch Alarm
-        │
-  SNS → 通知管理员重新扫码
-        │
-  管理员调用 POST /admin/weixin/qr
-        │
-  完成扫码 → 自动恢复 long-poll
-```
-
-### 8.2 飞书断连重连
-
-hermes-agent 的 `FeishuAdapter` 已内置：
-- `ws_reconnect_nonce`: 随机延迟后重连（默认 30s）
-- `ws_reconnect_interval`: 最大重连间隔（默认 120s）
-- `ws_ping_interval` / `ws_ping_timeout`: WebSocket keepalive
-
-### 8.3 AgentCore 调用失败
+The ECS Task Role must be scoped tightly:
 
 ```python
-async def invoke_with_retry(session_id, actor_id, payload, max_retries=2):
-    for attempt in range(max_retries + 1):
-        try:
-            return await asyncio.to_thread(
-                _invoke_agentcore, session_id, actor_id, payload
-            )
-        except ClientError as e:
-            code = e.response["Error"]["Code"]
-            if code in ("ThrottlingException", "ServiceUnavailableException"):
-                await asyncio.sleep(2 ** attempt)
-                continue
-            raise
-    # 所有重试失败 → 返回用户友好错误
-    return "抱歉，服务暂时繁忙，请稍后再试。"
+# REQUIRED — scoped to specific Runtime ARN
+iam.PolicyStatement(
+    actions=[
+        "bedrock-agentcore:InvokeAgentRuntime",
+        "bedrock-agentcore:InvokeAgentRuntimeForUser",
+    ],
+    resources=[agentcore_runtime_arn],   # NOT "*"
+)
+
+# REQUIRED — scoped to gateway-specific secrets only
+iam.PolicyStatement(
+    actions=["secretsmanager:GetSecretValue"],
+    resources=[
+        f"arn:aws:secretsmanager:{region}:{account}:secret:hermes/weixin/*",
+        f"arn:aws:secretsmanager:{region}:{account}:secret:hermes/feishu/*",
+    ],
+)
+
+# REQUIRED — CloudWatch logs
+iam.PolicyStatement(
+    actions=["logs:CreateLogStream", "logs:PutLogEvents"],
+    resources=[log_group_arn],
+)
 ```
 
-### 8.4 ECS Task 重启恢复
+**Permissions NOT granted to the gateway:**
 
-- Fargate Service `desiredCount=1` 确保始终运行一个实例
-- 容器启动时从 Secrets Manager 加载所有微信账号凭证
-- 飞书自动重连 WebSocket
-- 微信恢复 long-poll（如 token 未过期）
-- `get_updates_buf` (sync cursor) 持久化到 S3，重启后从上次位置继续
+| Permission | Why not needed |
+|------------|----------------|
+| `bedrock:InvokeModel` | LLM calls run inside AgentCore container |
+| `dynamodb:*` | Gateway uses hermes-agent's built-in allowlist, not DynamoDB |
+| `s3:*` | Workspace sync runs inside AgentCore container |
+| `kms:*` | No direct encryption/decryption |
+| `lambda:InvokeFunction` | No Lambda interaction |
+
+### 9.3 Session ID Integrity
+
+The proxy agent constructs session IDs deterministically from platform-authenticated identities:
+
+```python
+# WeChat: from_user_id is assigned by iLink API after QR login
+self._ac_session_id = f"weixin__{from_user_id}__{account_id}"
+
+# Feishu: open_id comes from Feishu SDK after OAuth
+self._ac_session_id = f"feishu__{open_id}__{chat_id}"
+```
+
+These values originate from platform-side authentication (WeChat QR scan, Feishu OAuth), not from user-supplied input. The same trust model applies as the Lambda Router (which derives session IDs from platform webhook payloads).
+
+### 9.4 Recommendations for Future Hardening
+
+These are not required for Phase 4 launch but would improve defense-in-depth:
+
+1. **Envelope validation in contract.py**: Extract `runtimeSessionId` from AgentCore request context and verify it matches `payload.userId`. This would prevent any caller (Lambda or ECS) from sending mismatched payloads.
+
+2. **AgentCore session ID namespace**: Use distinct prefixes for Lambda vs Gateway sessions (e.g., `gw:feishu:...` vs `lm:telegram:...`) to prevent cross-path session collisions.
+
+3. **CloudWatch anomaly detection**: Alert on unusual patterns like a single gateway sending requests to many distinct session IDs (possible credential compromise).
 
 ---
 
-## 9. 成本估算
+## 10. Breaking Change Assessment
 
-### 9.1 ECS Fargate 网关
+### 10.1 Impact on Existing Resources
 
-| 资源 | 配置 | 月成本 |
-|------|------|--------|
-| Fargate Task | 0.5 vCPU / 1 GB RAM, ARM64, 24×7 | ~$15 |
-| NAT Gateway 流量 | 微信 long-poll + 飞书 WebSocket (~2 GB/月) | ~$10 |
-| CloudWatch Logs | 1 GB/月 | ~$1 |
-| Secrets Manager | 5-10 secrets | ~$3 |
-| **网关小计** | | **~$29/月** |
+| Existing Resource | Modified by Phase 4? | Impact |
+|-------------------|---------------------|--------|
+| VPC (Phase 1) | **No** — read-only use | ECS Task deploys into existing private subnets |
+| Security/KMS (Phase 1) | **No** | Reads from Secrets Manager only; no new secrets created |
+| Guardrails (Phase 1) | **No** | Not involved |
+| AgentCore IAM Role (Phase 1) | **No** | ECS uses its own Task Role |
+| S3 Bucket (Phase 1) | **No** | Workspace sync runs inside AgentCore container |
+| AgentCore Runtime (Phase 2) | **Shared** | WeChat/Feishu messages go to the same Runtime as Telegram/Slack/Discord |
+| Router Lambda (Phase 3) | **No** — not modified | Completely independent |
+| API Gateway (Phase 3) | **No** | Not involved |
+| DynamoDB (Phase 3) | **No** | Gateway does not read/write the identity table |
+| CloudWatch (Phase 1) | **New log group only** | Separate `/ecs/hermes-gateway` log group |
 
-### 9.2 总成本（含现有架构）
+### 10.2 Shared AgentCore Runtime — Concurrency Risk
 
-| 组件 | 月成本 |
+The Lambda Router and ECS Gateway both call `invoke_agent_runtime()` on the **same Runtime ARN**. AgentCore allocates one microVM per unique `runtimeSessionId`.
+
+**Risk**: If AgentCore has an account-level concurrency quota on active microVMs, adding WeChat/Feishu users may compete with Telegram/Slack/Discord users for microVM slots.
+
+**Mitigations**:
+- WeChat iLink is 1:1 binding — limited concurrency (typically 1-5 accounts)
+- Feishu concurrent users are bounded by the bot's user base
+- AgentCore default quotas are typically generous (100+ concurrent sessions)
+- Monitor via CloudWatch and request quota increase if needed
+
+### 10.3 Files That Need Modification
+
+Only deployment scaffolding changes — no existing resource modifications:
+
+| File | Change |
 |------|--------|
-| AgentCore Runtime (所有平台共享) | $50–150 |
-| Bedrock Claude | $100–500 |
-| VPC + NAT | $30–45 |
-| Lambda + API GW + DynamoDB | $15–25 |
-| **ECS Gateway (新增)** | **$29** |
-| S3 + Secrets + CloudWatch | $10–20 |
-| **总计** | **~$234–769/月** |
+| `app.py` | Add `HermesGatewayStack` import and instantiation |
+| `scripts/deploy.sh` | Add `phase4` branch |
+| `scripts/teardown.sh` | Add Phase 4 cleanup |
+| `stacks/gateway_stack.py` | **New file** — CDK stack definition |
+| `gateway/` | **New directory** — Dockerfile, main.py, agentcore_proxy.py |
 
-新增成本约 $29/月（主要是 Fargate 常驻和 NAT 流量）。
+**Conclusion: Phase 4 introduces zero breaking changes to existing Phase 1-3 resources.**
 
 ---
 
-## 10. CDK Stack 设计
+## 11. Error Handling and Reliability
 
-```python
-# stacks/gateway_stack.py
+### 11.1 Built-in Platform Reliability (hermes-agent)
 
-class HermesGatewayStack(Stack):
-    """Phase 4: ECS Fargate gateway for WeChat + Feishu."""
+| Scenario | hermes-agent built-in handling |
+|----------|-------------------------------|
+| WeChat token expired (`errcode=-14`) | Pauses long-poll, logs error |
+| Feishu WebSocket disconnect | Random delay + auto-reconnect (30-120s) |
+| Message deduplication | `_recent_message_ids` set |
+| Oversized messages | Auto-split at 4,000 characters |
+| Network timeout | Retry with exponential backoff |
 
-    def __init__(self, scope, id, *, vpc, identity_table, runtime_arn, **kwargs):
-        # 1. ECS Cluster (use existing VPC private subnets)
-        # 2. Task Definition (ARM64, 512 CPU / 1024 MEM)
-        # 3. Container (ECR image, environment variables)
-        # 4. IAM Task Role (AgentCore invoke, DynamoDB, Secrets Manager)
-        # 5. Fargate Service (desiredCount=1, no ALB)
-        # 6. CloudWatch Log Group + Custom Metric Alarms
-        # 7. Optional: CloudWatch Alarm for WeixinTokenExpired
+### 11.2 AgentCore Call Reliability
+
+The `AgentCoreProxyAgent` includes retry logic with exponential backoff for transient errors (`ThrottlingException`, `ServiceUnavailableException`). After retries exhausted, returns a user-friendly error message.
+
+### 11.3 ECS-Level Reliability
+
+| Mechanism | Description |
+|-----------|-------------|
+| Fargate Service `desiredCount=1` | Auto-restarts crashed containers |
+| ECS Health Check | Replaces unhealthy tasks automatically |
+| CloudWatch Logs | Centralized log collection |
+| CloudWatch Alarm | Monitor token expiry, AgentCore call failures |
+
+### 11.4 WeChat Token Expiry Recovery
+
+```
+hermes-agent log: "errcode=-14"
+     │
+     ▼
+CloudWatch Logs Metric Filter (match "errcode=-14")
+     │
+     ▼
+CloudWatch Alarm → SNS → Notify admin
+     │
+     ▼
+Admin obtains new token → Update Secrets Manager → Restart ECS Task
 ```
 
-### 10.1 部署命令
+---
+
+## 12. Cost Estimate
+
+### 12.1 Phase 4 Incremental Cost
+
+| Resource | Configuration | Monthly Cost |
+|----------|--------------|-------------|
+| Fargate Task | 0.5 vCPU / 1 GB RAM, ARM64, 24×7 | ~$15 |
+| NAT Gateway traffic | ~2 GB/month (WeChat long-poll + Feishu WS) | ~$10 |
+| CloudWatch Logs | ~1 GB/month | ~$1 |
+| **Phase 4 total** | | **~$26/month** |
+
+No EFS ($0), no ALB ($0), no DynamoDB ($0).
+
+### 12.2 Total Cost
+
+| Component | Monthly Cost |
+|-----------|-------------|
+| Phase 1-3 (existing) | $200-600 |
+| **Phase 4 ECS Gateway (new)** | **$26** |
+| **Total** | **$226-626** |
+
+---
+
+## 13. deploy.sh Extension
 
 ```bash
-# Phase 4: Deploy ECS Gateway
-./scripts/deploy.sh phase4
+phase4() {
+    info "=== Phase 4: ECS Gateway (WeChat + Feishu) ==="
 
-# 或单独部署
-cdk deploy HermesGatewayStack
+    RUNTIME_ARN=$(jq -r '.context.agentcore_runtime_arn // empty' cdk.json)
+    if [ -z "$RUNTIME_ARN" ]; then
+        error "agentcore_runtime_arn not set. Run Phase 2 first."
+        exit 1
+    fi
+
+    # Copy hermes-agent source into build context
+    if [ ! -d "$PROJECT_DIR/gateway/hermes-agent" ]; then
+        if [ ! -d "$HOME/hermes-agent" ]; then
+            info "hermes-agent not found — cloning …"
+            git clone https://github.com/NousResearch/hermes-agent.git "$HOME/hermes-agent"
+        fi
+        rsync -a --exclude='.git' --exclude='node_modules' --exclude='__pycache__' \
+            "$HOME/hermes-agent/" "$PROJECT_DIR/gateway/hermes-agent/"
+    fi
+
+    # Build and push container image
+    info "Building gateway container …"
+    docker build -t hermes-gateway:latest -f gateway/Dockerfile gateway/
+
+    ECR_REPO="${PROJECT_NAME}-gateway"
+    # (ECR create + login + tag + push logic)
+
+    # CDK deploy
+    $CDK deploy "${PROJECT_NAME}-gateway" --require-approval never
+
+    info "Phase 4 complete."
+}
 ```
 
 ---
 
-## 11. 配置管理
+## 14. Implementation Plan
 
-### 11.1 环境变量
+### Phase 4a — Containerization + CDK (1 day)
 
-| 变量 | 必需 | 说明 |
-|------|------|------|
-| `AGENTCORE_RUNTIME_ARN` | 是 | AgentCore Runtime ARN |
-| `IDENTITY_TABLE` | 是 | DynamoDB identity table 名称 |
-| `WEIXIN_ENABLED` | 否 | 启用微信适配器 (默认 false) |
-| `WEIXIN_SECRETS_PREFIX` | 否 | Secrets Manager 前缀 (默认 `hermes/weixin/`) |
-| `FEISHU_ENABLED` | 否 | 启用飞书适配器 (默认 false) |
-| `FEISHU_APP_ID` | 条件 | 飞书 App ID (启用飞书时必需) |
-| `FEISHU_APP_SECRET_ARN` | 条件 | Secrets Manager ARN (启用飞书时必需) |
-| `FEISHU_CONNECTION_MODE` | 否 | `websocket` (默认) 或 `webhook` |
-| `FEISHU_DOMAIN` | 否 | `feishu` (默认) 或 `lark` (国际版) |
+- [ ] Create `gateway/agentcore_proxy.py` (~100 lines proxy agent)
+- [ ] Create `gateway/main.py` (patch + start gateway)
+- [ ] Create `gateway/Dockerfile`
+- [ ] Create `stacks/gateway_stack.py` (CDK: ECS + IAM)
+- [ ] Update `app.py` — add Phase 4 stack
+- [ ] Update `scripts/deploy.sh` — add `phase4` command
+- [ ] Update `scripts/teardown.sh` — add Phase 4 cleanup
+- [ ] Local docker verification that monkey-patch works
 
-### 11.2 Secrets Manager 结构
+### Phase 4b — Integration Testing (1 day)
 
-```
-hermes/weixin/account_001     # 微信实例 1 的凭证
-hermes/weixin/account_002     # 微信实例 2 的凭证
-hermes/feishu/app_secret      # 飞书 App Secret
-```
+- [ ] Deploy to ECS
+- [ ] Feishu: WebSocket connection, DM, group @mention
+- [ ] WeChat: long-poll, send/receive messages, typing, message splitting
+- [ ] Verify: messages processed by AgentCore (check microVM logs)
+- [ ] Verify: container restart auto-recovers connections
 
----
+### Phase 4c — Production Hardening (0.5 day)
 
-## 12. 实施计划
+- [ ] CloudWatch Dashboard + Alarms
+- [ ] Documentation updates (README, DEPLOYMENT_GUIDE)
 
-### Phase 4a — 基础框架（1-2 天）
-
-- [ ] 创建 `gateway/` 目录结构（在 sample 项目中）
-- [ ] 实现 `AgentCoreDispatcher`（复用 Router Lambda 的 `_invoke_agentcore` 逻辑）
-- [ ] 实现 Admin Health API
-- [ ] CDK Stack: ECS Cluster + Task Definition + IAM Role
-- [ ] Dockerfile 构建
-
-### Phase 4b — 飞书集成（1 天）
-
-- [ ] 从 hermes-agent 提取飞书 Adapter 核心逻辑（WebSocket 连接 + 消息解析 + 发送）
-- [ ] 适配为转发模式（消息 → AgentCore Dispatcher，而非本地 agent loop）
-- [ ] DynamoDB allowlist 集成
-- [ ] 测试：飞书 DM + 群聊 @mention
-
-### Phase 4c — 微信集成（1-2 天）
-
-- [ ] 从 hermes-agent 提取微信 Adapter 核心逻辑（long-poll + QR 登录 + 消息收发）
-- [ ] 实现 WeixinAdapterManager（多实例管理）
-- [ ] QR 登录 Admin API
-- [ ] Secrets Manager 凭证持久化
-- [ ] Token 过期检测 + CloudWatch 告警
-- [ ] 测试：QR 登录 → 收发消息 → token 过期恢复
-
-### Phase 4d — 生产化（1 天）
-
-- [ ] CloudWatch Dashboard（网关指标 + 平台连接状态）
-- [ ] 健壮性测试（网络断开、容器重启、AgentCore 不可用）
-- [ ] 文档更新（README、部署指南）
+**Total: ~2.5 days**
 
 ---
 
-## 13. 替代方案对比
+## 15. Comparison of Approaches
 
-| 方案 | 优点 | 缺点 | 适合场景 |
-|------|------|------|---------|
-| **A: ECS 网关 + AgentCore 后端（本方案）** | 复用 AgentCore 隔离能力；网关轻量；统一身份管理 | 多一层转发延迟；需要维护网关代码 | 多平台、多用户、企业级 |
-| **B: ECS 直接运行 hermes-agent gateway** | 最简单；hermes-agent 原生支持微信/飞书 | 不经过 AgentCore；失去 per-user 隔离；需要直接管理 API key | 个人使用、快速验证 |
-| **C: EC2 + hermes-agent + Bedrock** | 传统部署；灵活 | 需要自己管理服务器；无自动扩缩；无 per-user 隔离 | 单用户自托管 |
-| **D: 只使用飞书 Webhook 模式 + Lambda** | 无需 ECS；与现有架构一致 | 不支持微信；飞书 Webhook 需要公网入站 | 只需飞书且不需微信 |
-
----
-
-## 14. 风险与限制
-
-| 风险 | 影响 | 缓解措施 |
-|------|------|---------|
-| 微信 iLink API 不稳定或变更 | 微信功能不可用 | 监控 errcode，告警通知；API 变更时更新 adapter |
-| 微信 token 频繁过期 | 需要人工干预扫码 | CloudWatch 告警 + 文档化恢复流程；探索自动刷新可能性 |
-| 微信 1:1 限制无法绕过 | 每个用户需要独立实例 | 明确文档说明；需要多用户时建议使用 WeCom |
-| 飞书 WebSocket 被防火墙阻断 | 飞书不可用 | 自动降级到 Webhook 模式 |
-| AgentCore 冷启动延迟 | 用户首条消息等待 10-30s | 微信/飞书发送 typing 指示器；考虑预热策略 |
-| ECS 单点故障 | 微信/飞书全部断连 | Fargate Service 自动重启；可选扩展到多 AZ |
+| Dimension | This approach (native gateway + AgentCore) | Custom thin gateway + AgentCore | Full hermes-agent in ECS (no AgentCore) |
+|-----------|-------------------------------------------|--------------------------------|----------------------------------------|
+| New code | ~100 lines (proxy agent) | ~2,000 lines | 0 lines |
+| Per-user isolation | **Yes** (AgentCore microVM) | **Yes** | **No** |
+| Feature completeness | **Full** (hermes-agent native) | Message forwarding only | **Full** |
+| Maintenance cost | Low (git pull to sync) | High (track protocol changes) | Low |
+| Monthly cost | ~$26 | ~$29 | ~$44 |
+| AgentCore cold start | Yes (10-30s first message) | Yes | No |

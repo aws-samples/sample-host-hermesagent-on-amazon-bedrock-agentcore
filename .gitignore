@@ -53,3 +53,4 @@ lambda/router/*.dist-info/
 
 # Docker / submodule
 hermes-agent/
+gateway/hermes-agent/

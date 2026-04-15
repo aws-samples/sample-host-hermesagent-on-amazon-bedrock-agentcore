@@ -8,10 +8,11 @@
 #   ./scripts/teardown.sh --dry-run    # Show what would be destroyed
 #
 # Destruction order (reverse of deploy):
-#   1. Phase 3 CDK stacks  (router, cron, token-monitoring)
-#   2. Phase 2 AgentCore   (AgentCore-hermes-default stack + runtime)
-#   3. Phase 1 CDK stacks  (observability, agentcore, guardrails, security, vpc)
-#   4. Retained resources   (S3, DynamoDB, KMS, Cognito — skipped by cdk destroy)
+#   1. Phase 4 CDK stack   (ECS gateway — WeChat + Feishu)
+#   2. Phase 3 CDK stacks  (router, cron, token-monitoring)
+#   3. Phase 2 AgentCore   (AgentCore-hermes-default stack + runtime)
+#   4. Phase 1 CDK stacks  (observability, agentcore, guardrails, security, vpc)
+#   5. Retained resources   (S3, DynamoDB, KMS, Cognito — skipped by cdk destroy)
 # --------------------------------------------------------------------------
 set -euo pipefail
 
@@ -95,6 +96,7 @@ echo ""
 
 info "CloudFormation stacks to destroy:"
 for STACK in \
+    "${PROJECT_NAME}-gateway" \
     "${PROJECT_NAME}-token-monitoring" \
     "${PROJECT_NAME}-cron" \
     "${PROJECT_NAME}-router" \
@@ -135,10 +137,24 @@ if ! $FORCE; then
 fi
 
 # --------------------------------------------------------------------------
-# Step 1: Destroy Phase 3 CDK stacks
+# Step 1: Destroy Phase 4 CDK stack (ECS Gateway)
 # --------------------------------------------------------------------------
 
-step "1/4  Destroying Phase 3 stacks (router, cron, token-monitoring) …"
+step "1/5  Destroying Phase 4 stack (ECS gateway) …"
+
+if stack_exists "${PROJECT_NAME}-gateway"; then
+    $CDK destroy "${PROJECT_NAME}-gateway" --force 2>/dev/null \
+        || warn "Phase 4 gateway stack may have already been deleted."
+    info "Phase 4 gateway stack destroyed."
+else
+    info "Phase 4 gateway stack not deployed — skipping."
+fi
+
+# --------------------------------------------------------------------------
+# Step 2: Destroy Phase 3 CDK stacks
+# --------------------------------------------------------------------------
+
+step "2/5  Destroying Phase 3 stacks (router, cron, token-monitoring) …"
 
 $CDK destroy \
     "${PROJECT_NAME}-token-monitoring" \
@@ -149,10 +165,10 @@ $CDK destroy \
 info "Phase 3 stacks destroyed."
 
 # --------------------------------------------------------------------------
-# Step 2: Destroy Phase 2 AgentCore runtime
+# Step 3: Destroy Phase 2 AgentCore runtime
 # --------------------------------------------------------------------------
 
-step "2/4  Destroying Phase 2 (AgentCore runtime) …"
+step "3/5  Destroying Phase 2 (AgentCore runtime) …"
 
 # The agentcore CLI does not have a destroy command.
 # The runtime is deployed as a CloudFormation stack by the toolkit CDK.
@@ -182,10 +198,10 @@ fi
 info "Phase 2 resources destroyed."
 
 # --------------------------------------------------------------------------
-# Step 3: Destroy Phase 1 CDK stacks
+# Step 4: Destroy Phase 1 CDK stacks
 # --------------------------------------------------------------------------
 
-step "3/4  Destroying Phase 1 stacks (observability, agentcore, guardrails, security, vpc) …"
+step "4/5  Destroying Phase 1 stacks (observability, agentcore, guardrails, security, vpc) …"
 
 # Destroy in reverse dependency order.
 $CDK destroy \
@@ -202,7 +218,7 @@ info "Phase 1 stacks destroyed."
 # Step 4: Clean up retained resources
 # --------------------------------------------------------------------------
 
-step "4/4  Cleaning up retained resources (RemovalPolicy.RETAIN) …"
+step "5/5  Cleaning up retained resources (RemovalPolicy.RETAIN) …"
 
 # 4a. S3 bucket — must empty before deletion.
 BUCKET="${PROJECT_NAME}-user-files-${ACCOUNT}-${REGION}"

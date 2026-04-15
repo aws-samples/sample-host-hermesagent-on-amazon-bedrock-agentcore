@@ -20,6 +20,7 @@ from stacks.observability_stack import HermesObservabilityStack
 from stacks.router_stack import HermesRouterStack
 from stacks.cron_stack import HermesCronStack
 from stacks.token_monitoring_stack import HermesTokenMonitoringStack
+from stacks.gateway_stack import HermesGatewayStack
 
 app = cdk.App()
 
@@ -82,5 +83,18 @@ token_monitoring_stack = HermesTokenMonitoringStack(
     alarm_topic_arn=observability_stack.alarm_topic.topic_arn,
 )
 token_monitoring_stack.add_dependency(observability_stack)
+
+# --------------------------------------------------------------------------
+# Phase 4 stack (optional — ECS Gateway for WeChat + Feishu)
+# --------------------------------------------------------------------------
+
+gateway_stack = HermesGatewayStack(
+    app,
+    f"{project}-gateway",
+    vpc=vpc_stack.vpc,
+    agentcore_runtime_arn=agentcore_runtime_arn,
+    agentcore_qualifier=agentcore_qualifier,
+)
+gateway_stack.add_dependency(vpc_stack)
 
 app.synth()

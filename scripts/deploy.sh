@@ -99,19 +99,23 @@ phase2() {
 
     # Extract runtime IDs and write back to cdk.json.
     info "Extracting runtime IDs …"
-    STATUS_JSON=$(agentcore status --json 2>/dev/null || echo "{}")
+    # Strip ANSI escape sequences (agentcore CLI may emit cursor control codes).
+    STATUS_JSON=$(agentcore status --json 2>/dev/null | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' || echo "{}")
     RUNTIME_ARN=$(echo "$STATUS_JSON" | jq -r '
+        .resources[0].identifier //
         .runtimes[0].agentRuntimeArn //
         .runtimes[0].runtimeArn //
         .agentRuntimeArn //
         .runtimeArn //
         empty' 2>/dev/null || echo "")
+    # Extract qualifier from the runtime ARN tail (e.g. "hermes_hermes-55EPNeG2QF")
     QUALIFIER=$(echo "$STATUS_JSON" | jq -r '
+        .resources[0].identifier //
         .runtimes[0].agentRuntimeId //
         .runtimes[0].qualifier //
         .qualifier //
         .endpointId //
-        empty' 2>/dev/null || echo "")
+        empty' 2>/dev/null | sed 's|.*/||' || echo "")
 
     if [ -n "$RUNTIME_ARN" ]; then
         info "Runtime ARN:  $RUNTIME_ARN"
@@ -169,6 +173,81 @@ phase3() {
 }
 
 # --------------------------------------------------------------------------
+# Phase 4: ECS Gateway for WeChat + Feishu (optional)
+# --------------------------------------------------------------------------
+phase4() {
+    info "=== Phase 4: ECS Gateway (WeChat + Feishu) ==="
+
+    # Verify runtime ARN is set.
+    RUNTIME_ARN=$(jq -r '.context.agentcore_runtime_arn // empty' cdk.json)
+    if [ -z "$RUNTIME_ARN" ]; then
+        error "agentcore_runtime_arn not set in cdk.json. Run Phase 2 first."
+        exit 1
+    fi
+
+    AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+    AWS_REGION=$(aws configure get region 2>/dev/null || echo "us-west-2")
+    ECR_REPO="${PROJECT_NAME}-gateway"
+    ECR_URI="${AWS_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+
+    # ── Step 1: Ensure ECR repo exists (create before CDK to push image first) ──
+    if ! aws ecr describe-repositories --repository-names "$ECR_REPO" &>/dev/null; then
+        info "Creating ECR repository: $ECR_REPO"
+        aws ecr create-repository \
+            --repository-name "$ECR_REPO" \
+            --image-scanning-configuration scanOnPush=true \
+            --no-cli-pager >/dev/null
+    fi
+
+    # ── Step 2: Copy hermes-agent source into build context ──
+    if [ ! -d "$PROJECT_DIR/gateway/hermes-agent" ]; then
+        if [ ! -d "$HOME/hermes-agent" ]; then
+            info "hermes-agent not found at $HOME/hermes-agent — cloning …"
+            git clone https://github.com/NousResearch/hermes-agent.git "$HOME/hermes-agent"
+        fi
+        info "Copying hermes-agent source into gateway/ for Docker build …"
+        rsync -a --exclude='.git' --exclude='node_modules' --exclude='__pycache__' \
+            "$HOME/hermes-agent/" "$PROJECT_DIR/gateway/hermes-agent/"
+    fi
+
+    # ── Step 3: Build and push container image ──
+    info "ECR login …"
+    aws ecr get-login-password --region "$AWS_REGION" | \
+        docker login --username AWS --password-stdin "${AWS_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+    info "Building gateway container image …"
+    docker build \
+        --platform linux/amd64 \
+        -t "${ECR_URI}:latest" \
+        -f "$PROJECT_DIR/gateway/Dockerfile" \
+        "$PROJECT_DIR/gateway/"
+
+    info "Pushing to ECR …"
+    docker push "${ECR_URI}:latest"
+
+    # ── Step 4: CDK deploy (image is already in ECR, Service can start) ──
+    info "Deploying CDK gateway stack …"
+    $CDK deploy "${PROJECT_NAME}-gateway" --require-approval never
+
+    # ── Step 5: Force new deployment to pick up the latest image ──
+    info "Triggering ECS deployment …"
+    aws ecs update-service \
+        --cluster "${PROJECT_NAME}-gateway" \
+        --service "${PROJECT_NAME}-gateway" \
+        --force-new-deployment \
+        --no-cli-pager >/dev/null
+
+    info "Phase 4 complete."
+    info "ECS Gateway cluster: ${PROJECT_NAME}-gateway"
+    info "ECR image: ${ECR_URI}:latest"
+    info ""
+    info "To configure WeChat/Feishu, set secrets in Secrets Manager:"
+    info "  aws secretsmanager put-secret-value --secret-id hermes/weixin/token --secret-string 'YOUR_TOKEN'"
+    info "  aws secretsmanager put-secret-value --secret-id hermes/feishu/app-id --secret-string 'YOUR_APP_ID'"
+    info "  aws secretsmanager put-secret-value --secret-id hermes/feishu/app-secret --secret-string 'YOUR_SECRET'"
+}
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 case "$PHASE" in
@@ -186,12 +265,15 @@ case "$PHASE" in
     phase3)
         phase3
         ;;
+    phase4)
+        phase4
+        ;;
     cdk-only)
         phase1
         phase3
         ;;
     *)
-        error "Usage: $0 [all|phase1|phase2|phase3|cdk-only]"
+        error "Usage: $0 [all|phase1|phase2|phase3|phase4|cdk-only]"
         exit 1
         ;;
 esac

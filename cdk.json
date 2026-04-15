@@ -1,7 +1,9 @@
 {
   "app": "python3 app.py",
   "watch": {
-    "include": ["**"],
+    "include": [
+      "**"
+    ],
     "exclude": [
       "README.md",
       "cdk*.json",
@@ -16,17 +18,13 @@
   },
   "context": {
     "project_name": "hermes-agentcore",
-
     "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
     "@aws-cdk/core:stackRelativeExports": true,
-
     "default_model_id": "global.anthropic.claude-opus-4-6-v1",
     "warmup_model_id": "global.anthropic.claude-sonnet-4-6-v1",
-
     "session_idle_timeout": 1800,
     "session_max_lifetime": 28800,
     "workspace_sync_interval_seconds": 300,
-
     "enable_guardrails": false,
     "enable_token_monitoring": true,
     "daily_token_budget": 2000000,
@@ -36,9 +34,7 @@
 
     "vpc_cidr": "10.0.0.0/16",
     "az_count": 2,
-
     "alarm_email": "",
-
     "agentcore_runtime_arn": "",
     "agentcore_qualifier": ""
   }

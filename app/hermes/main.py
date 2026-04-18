@@ -149,10 +149,14 @@ async def invoke(payload, context):
         if payload.get("chatId"):
             system_extra += f" Chat ID: {payload['chatId']}."
 
+        # Restore conversation history from the gateway payload so the
+        # agent has context from previous turns.
+        history = payload.get("conversationHistory") or None
+
         result = agent.run_conversation(
             user_message=message,
             system_message=system_extra,
-            conversation_history=None,
+            conversation_history=history,
         )
         yield result.get("final_response", "")
     except Exception as exc:

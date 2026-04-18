@@ -69,12 +69,27 @@ class AgentCoreProxyAgent:
         persist_user_message=None,
     ):
         """Call invoke_agent_runtime() and return an AIAgent-compatible result."""
-        payload = json.dumps({
+        payload_dict = {
             "action": "chat",
             "message": user_message,
             "userId": self._ac_user_id,
             "channel": self.platform,
-        })
+        }
+
+        # Forward conversation history so the agent has context from
+        # previous turns.  Only include user/assistant text messages to
+        # keep the payload compact (skip tool calls, tool results, etc.).
+        if conversation_history:
+            compact_history = []
+            for msg in conversation_history:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+                    compact_history.append({"role": role, "content": content})
+            if compact_history:
+                payload_dict["conversationHistory"] = compact_history
+
+        payload = json.dumps(payload_dict)
 
         kwargs = {
             "agentRuntimeArn": RUNTIME_ARN,

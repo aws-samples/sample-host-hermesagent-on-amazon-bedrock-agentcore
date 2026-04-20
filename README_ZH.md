@@ -239,14 +239,54 @@ print(result)
 
 ### 微信（Phase 4 — ECS 网关）
 
-微信需要持久化长轮询连接，仅通过 Phase 4 的 ECS 网关支持。
+微信通过 **iLink Bot API** (`ilinkai.weixin.qq.com`) 接入个人微信账号，需要持久化长轮询连接，仅通过 Phase 4 的 ECS 网关支持。
 
-1. 部署 Phase 4：`./scripts/deploy.sh phase4`
-2. 将微信 Token 存入 Secrets Manager：
-   ```bash
-   aws secretsmanager put-secret-value --secret-id hermes/weixin/token --secret-string '你的Token'
-   ```
-3. 长文本回复（> 2000 字符）自动转换为 `.md` 文件发送
+#### 第一步：获取微信 Token
+
+Token 通过**扫码登录**获取，不是固定的 API Key。
+
+在本地运行 hermes-agent 网关配置：
+
+```bash
+cd ~/hermes-agent
+pip install -e ".[messaging]"
+hermes gateway setup
+```
+
+选择 **Weixin**，配置流程会：
+1. 从 iLink Bot API 请求登录二维码
+2. 在终端显示二维码
+3. **用微信扫描二维码**，在手机上确认授权
+4. 返回凭证：`WEIXIN_ACCOUNT_ID` 和 `WEIXIN_TOKEN`
+
+凭证保存在 `~/.hermes/.env`，也可在 `~/.hermes/weixin/accounts/{account_id}.json` 中找到。
+
+> **注意：** Token 是**会话令牌**，非永久密钥。会话过期后需要重新扫码。
+
+#### 第二步：部署并配置
+
+```bash
+# 部署 Phase 4
+./scripts/deploy.sh phase4
+
+# 将凭证存入 Secrets Manager
+aws secretsmanager put-secret-value \
+  --secret-id hermes/weixin/token \
+  --secret-string '第一步获取的TOKEN'
+
+aws secretsmanager put-secret-value \
+  --secret-id hermes/weixin/account-id \
+  --secret-string '第一步获取的ACCOUNT_ID'
+```
+
+#### 可选环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `WEIXIN_DM_POLICY` | `open` | 私聊策略：`open`（开放）、`allowlist`（白名单）、`disabled`（禁用）、`pairing`（配对审批） |
+| `WEIXIN_ALLOWED_USERS` | (空) | 白名单模式下允许的用户 ID，逗号分隔 |
+| `WEIXIN_GROUP_POLICY` | `disabled` | 群聊策略：`open`、`allowlist`、`disabled` |
+| `WEIXIN_FILE_THRESHOLD` | `2000` | 超过此字符数的回复自动转为 `.md` 文件发送 |
 
 ### 飞书 (Feishu/Lark)
 

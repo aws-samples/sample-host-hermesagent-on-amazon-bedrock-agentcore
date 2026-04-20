@@ -130,7 +130,7 @@ npm install
 Phase 4 deploys an **ECS Fargate gateway** that runs the hermes-agent platform adapters (WeChat long-poll, Feishu WebSocket) in a persistent container. All AI inference is forwarded to AgentCore via `AgentCoreProxyAgent` — the gateway handles only platform protocols.
 
 **When you need Phase 4:**
-- WeChat (企业微信) — requires persistent long-poll connection
+- WeChat — requires persistent long-poll connection (via iLink Bot API)
 - Feishu WebSocket — lower latency than webhook mode
 
 **What it deploys:**
@@ -212,14 +212,54 @@ Configure webhooks after Phase 3 deployment:
 
 ### WeChat (Phase 4 — ECS Gateway)
 
-WeChat requires a persistent long-poll connection and is only available via the Phase 4 ECS gateway.
+WeChat uses the **iLink Bot API** (`ilinkai.weixin.qq.com`) for personal WeChat accounts. It requires a persistent long-poll connection and is only available via the Phase 4 ECS gateway.
 
-1. Deploy Phase 4: `./scripts/deploy.sh phase4`
-2. Store WeChat token in Secrets Manager:
-   ```bash
-   aws secretsmanager put-secret-value --secret-id hermes/weixin/token --secret-string 'YOUR_TOKEN'
-   ```
-3. Long responses (> 2000 chars) are automatically delivered as `.md` files
+#### Step 1: Obtain WeChat Token
+
+The token is obtained through an interactive QR code login — **not** a static API key.
+
+Run the hermes-agent gateway setup locally:
+
+```bash
+cd ~/hermes-agent
+pip install -e ".[messaging]"
+hermes gateway setup
+```
+
+Select **Weixin** when prompted. The setup will:
+1. Request a QR code from iLink Bot API
+2. Display the QR code in your terminal
+3. **Scan the QR code with your WeChat app** and confirm on your phone
+4. Return credentials: `WEIXIN_ACCOUNT_ID` and `WEIXIN_TOKEN`
+
+The credentials are saved to `~/.hermes/.env`. You can also find them in `~/.hermes/weixin/accounts/{account_id}.json`.
+
+> **Note:** The token is a **session token**, not a permanent key. If the session expires, you will need to re-scan the QR code.
+
+#### Step 2: Deploy and Configure
+
+```bash
+# Deploy Phase 4
+./scripts/deploy.sh phase4
+
+# Store credentials in Secrets Manager
+aws secretsmanager put-secret-value \
+  --secret-id hermes/weixin/token \
+  --secret-string 'TOKEN_FROM_STEP_1'
+
+aws secretsmanager put-secret-value \
+  --secret-id hermes/weixin/account-id \
+  --secret-string 'ACCOUNT_ID_FROM_STEP_1'
+```
+
+#### Optional Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WEIXIN_DM_POLICY` | `open` | DM authorization: `open`, `allowlist`, `disabled`, `pairing` |
+| `WEIXIN_ALLOWED_USERS` | (empty) | Comma-separated allowed user IDs (for `allowlist` mode) |
+| `WEIXIN_GROUP_POLICY` | `disabled` | Group chat policy: `open`, `allowlist`, `disabled` |
+| `WEIXIN_FILE_THRESHOLD` | `2000` | Auto-convert text to `.md` file above this character count |
 
 ### Feishu (Lark)
 

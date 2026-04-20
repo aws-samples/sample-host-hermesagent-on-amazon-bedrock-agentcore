@@ -38,6 +38,10 @@ RUNTIME_ARN = os.environ.get("AGENTCORE_RUNTIME_ARN", "")
 QUALIFIER = os.environ.get("AGENTCORE_QUALIFIER", "")
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 
+# Conversation history limits.
+HISTORY_MAX_TURNS = int(os.environ.get("HISTORY_MAX_TURNS", "20"))
+HISTORY_TTL_DAYS = int(os.environ.get("HISTORY_TTL_DAYS", "7"))
+
 # Lazy-init the agentcore client (might not be available in test).
 _agentcore_client: Any = None
 
@@ -550,11 +554,76 @@ def _get_feishu_tenant_token() -> str:
 
 
 # --------------------------------------------------------------------------
+# Conversation history (DynamoDB)
+# --------------------------------------------------------------------------
+
+def _load_history(session_id: str) -> list[dict]:
+    """Load the most recent conversation turns from DynamoDB.
+
+    Returns a list of {"role": ..., "content": ...} dicts in chronological
+    order, bounded by HISTORY_MAX_TURNS.
+    """
+    if HISTORY_MAX_TURNS <= 0:
+        return []
+    try:
+        from boto3.dynamodb.conditions import Key
+
+        resp = identity_table.query(
+            KeyConditionExpression=Key("PK").eq(f"HIST#{session_id}"),
+            ScanIndexForward=False,  # newest first
+            Limit=HISTORY_MAX_TURNS * 2,  # each turn = user + assistant
+        )
+        items = resp.get("Items", [])
+        items.reverse()  # chronological order
+        return [{"role": item["role"], "content": item["content"]} for item in items]
+    except ClientError as exc:
+        logger.warning("Failed to load history for %s: %s", session_id, exc)
+        return []
+
+
+def _save_history(session_id: str, user_message: str, assistant_message: str) -> None:
+    """Persist a conversation turn (user + assistant) to DynamoDB.
+
+    Items are keyed by millisecond timestamp so they sort chronologically.
+    A TTL attribute enables automatic DynamoDB cleanup of old sessions.
+    """
+    now_ms = int(time.time() * 1000)
+    ttl = int(time.time()) + HISTORY_TTL_DAYS * 86400
+
+    try:
+        identity_table.put_item(Item={
+            "PK": f"HIST#{session_id}",
+            "SK": f"{now_ms:015d}#0",
+            "role": "user",
+            "content": user_message[:4000],
+            "ts": int(time.time()),
+            "ttl": ttl,
+        })
+        identity_table.put_item(Item={
+            "PK": f"HIST#{session_id}",
+            "SK": f"{now_ms:015d}#1",
+            "role": "assistant",
+            "content": assistant_message[:4000],
+            "ts": int(time.time()),
+            "ttl": ttl,
+        })
+    except ClientError as exc:
+        logger.warning("Failed to save history for %s: %s", session_id, exc)
+
+
+# --------------------------------------------------------------------------
 # AgentCore invocation
 # --------------------------------------------------------------------------
 
 def _invoke_agentcore(session_id: str, actor_id: str, payload: dict) -> str:
     """Call InvokeAgentRuntime and return the text response."""
+    user_message = payload.get("message", "")
+
+    # Inject conversation history into the payload.
+    history = _load_history(session_id)
+    if history:
+        payload["conversationHistory"] = history
+
     try:
         response = _agentcore().invoke_agent_runtime(
             agentRuntimeArn=RUNTIME_ARN,
@@ -583,6 +652,11 @@ def _invoke_agentcore(session_id: str, actor_id: str, payload: dict) -> str:
 
         logger.info("AgentCore response length=%d, status=%s",
                      len(result), response.get("statusCode", ""))
+
+        # Persist this turn so future requests have context.
+        if user_message and result:
+            _save_history(session_id, user_message, result)
+
         return result
     except Exception as exc:
         logger.exception("AgentCore invocation failed")

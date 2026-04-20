@@ -7,11 +7,11 @@
 ## 架构
 
 ```
-Telegram / Slack / Discord / 飞书
-         │
-    API Gateway
-         │
-    Router Lambda ──→ AgentCore Runtime (Firecracker 微虚拟机)
+Telegram / Slack / Discord / 飞书             微信 / 飞书 (长连接)
+         │                                          │
+    API Gateway                              ECS Fargate 网关
+         │                                          │
+    Router Lambda ──→ AgentCore Runtime ←── AgentCore Proxy
                            │
                     ┌──────────────┐
                     │  main.py     │  AgentCore 入口
@@ -24,9 +24,9 @@ Telegram / Slack / Discord / 飞书
 
 - **用户级隔离** — 每个用户独占一个 Firecracker 微虚拟机
 - **全托管无服务器** — 无需管理服务器，自动弹性伸缩，按使用量付费
-- **多频道接入** — Telegram、Slack、Discord、飞书 (Feishu/Lark) 通过 Webhook 集成
+- **多频道接入** — Telegram、Slack、Discord、飞书通过 Webhook；微信通过 ECS 网关
 - **原生 Bedrock** — Claude 模型通过 SigV4 认证调用（无需 API Key）
-- **基础设施即代码** — 8 个 CDK 栈，三阶段部署
+- **基础设施即代码** — 9 个 CDK 栈，四阶段部署
 - **持久化状态** — S3 备份工作区，跨会话保留记忆和技能
 
 ## 工作原理
@@ -50,6 +50,12 @@ Hermes Agent 无需修改即可运行在 AgentCore 容器中。关键集成是 `
 │   ├── contract.py          # HTTP 服务器 (/ping, /invocations)
 │   ├── workspace_sync.py    # S3 ↔ SQLite 同步
 │   └── bedrock_provider.py  # Bedrock 模型配置
+├── gateway/                 # ECS Fargate 网关 (Phase 4)
+│   ├── main.py              # 网关入口
+│   ├── agentcore_proxy.py   # AIAgent → AgentCore 代理 (monkey-patch)
+│   ├── weixin_file_patch.py # 长文本自动转 .md 文件发送到微信
+│   ├── healthcheck.py       # ECS 健康检查 HTTP 服务
+│   └── Dockerfile           # 网关容器镜像
 ├── lambda/                  # AWS Lambda 函数
 │   ├── router/              # 频道 Webhook → AgentCore 路由
 │   ├── cron/                # 定时任务执行
@@ -61,6 +67,7 @@ Hermes Agent 无需修改即可运行在 AgentCore 容器中。关键集成是 `
 │   ├── agentcore_stack.py   # IAM 角色、S3 工作区桶
 │   ├── observability_stack.py   # CloudWatch 仪表盘与告警
 │   ├── router_stack.py      # API Gateway + Router Lambda
+│   ├── gateway_stack.py     # ECS Fargate 网关 (微信 + 飞书)
 │   ├── cron_stack.py        # 定时调用
 │   └── token_monitoring_stack.py # Token 用量分析
 ├── agentcore/               # AgentCore CLI 配置
@@ -125,7 +132,41 @@ cat agentcore/aws-targets.json  # 确认 account 字段正确
 
 # Phase 3: Router Lambda、定时任务、Token 监控
 ./scripts/deploy.sh phase3
+
+# Phase 4（可选）: ECS 网关，支持微信、飞书长连接
+./scripts/deploy.sh phase4
 ```
+
+### Phase 4: ECS 网关（可选）
+
+Phase 4 部署一个 **ECS Fargate 网关**，运行 hermes-agent 的平台适配器（微信长轮询、飞书 WebSocket），以持久化容器方式运行。所有 AI 推理通过 `AgentCoreProxyAgent` 转发到 AgentCore — 网关只处理平台协议。
+
+**需要 Phase 4 的场景：**
+- 微信（企业微信）— 需要持久化长轮询连接
+- 飞书 WebSocket — 比 Webhook 模式延迟更低
+
+**部署内容：**
+- ECR 镜像仓库
+- ECS Fargate 集群 + 服务（单任务，自动重启）
+- VPC 网络、安全组、IAM 角色
+- Secrets Manager 集成，管理平台凭证
+
+**部署后配置平台凭证：**
+
+```bash
+# 微信
+aws secretsmanager put-secret-value --secret-id hermes/weixin/token --secret-string '你的Token'
+
+# 飞书
+aws secretsmanager put-secret-value --secret-id hermes/feishu/app-id --secret-string '你的AppID'
+aws secretsmanager put-secret-value --secret-id hermes/feishu/app-secret --secret-string '你的AppSecret'
+```
+
+**特性：**
+- 长文本自动转换为 `.md` 文件发送到微信（阈值可通过 `WEIXIN_FILE_THRESHOLD` 配置）
+- 会话历史转发到 AgentCore，支持多轮对话上下文
+- 冷启动重试，指数退避（5s → 10s → 20s）
+- 健康检查端点 `http://localhost:8080/health`
 
 ### 关键配置文件
 
@@ -196,6 +237,17 @@ print(result)
 
 详见 [docs/DISCORD_SETUP.md](docs/DISCORD_SETUP.md)。
 
+### 微信（Phase 4 — ECS 网关）
+
+微信需要持久化长轮询连接，仅通过 Phase 4 的 ECS 网关支持。
+
+1. 部署 Phase 4：`./scripts/deploy.sh phase4`
+2. 将微信 Token 存入 Secrets Manager：
+   ```bash
+   aws secretsmanager put-secret-value --secret-id hermes/weixin/token --secret-string '你的Token'
+   ```
+3. 长文本回复（> 2000 字符）自动转换为 `.md` 文件发送
+
 ### 飞书 (Feishu/Lark)
 
 1. 在 [飞书开放平台](https://open.feishu.cn) 创建自建应用
@@ -227,8 +279,9 @@ print(result)
 | Bedrock Claude 模型 | $100–500 |
 | VPC + NAT | $30–45 |
 | Lambda + API GW + DynamoDB | $15–25 |
+| ECS Fargate 网关 (Phase 4) | $15–30 |
 | S3 + Secrets + CloudWatch | $10–20 |
-| **合计** | **~$210–740** |
+| **合计** | **~$220–770** |
 
 ## 文档
 

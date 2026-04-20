@@ -7,11 +7,11 @@ Deploy [Hermes Agent](https://github.com/NousResearch/hermes-agent) on **Amazon 
 ## Architecture
 
 ```
-Telegram / Slack / Discord / Feishu
-         │
-    API Gateway
-         │
-    Router Lambda ──→ AgentCore Runtime (Firecracker microVM)
+Telegram / Slack / Discord / Feishu          WeChat / Feishu (long-lived)
+         │                                          │
+    API Gateway                              ECS Fargate Gateway
+         │                                          │
+    Router Lambda ──→ AgentCore Runtime ←── AgentCore Proxy
                            │
                     ┌──────────────┐
                     │  main.py     │  AgentCore entrypoint
@@ -24,9 +24,9 @@ Telegram / Slack / Discord / Feishu
 
 - **Per-user isolation** — Firecracker microVMs, one per session
 - **Serverless** — No servers to manage, auto-scaling, pay-per-use
-- **Multi-channel** — Telegram, Slack, Discord, Feishu (Lark) via webhook integration
+- **Multi-channel** — Telegram, Slack, Discord, Feishu (Lark) via webhook; WeChat via ECS gateway
 - **Native Bedrock** — Claude models via SigV4 auth (no API keys needed)
-- **Infrastructure as Code** — 8 CDK stacks, three-phase deployment
+- **Infrastructure as Code** — 9 CDK stacks, four-phase deployment
 - **Persistent state** — S3-backed workspace for memory and sessions
 
 ## How It Works
@@ -50,6 +50,12 @@ Hermes Agent runs unmodified inside AgentCore containers. The key integration is
 │   ├── contract.py          # HTTP server (/ping, /invocations)
 │   ├── workspace_sync.py    # S3 ↔ SQLite sync
 │   └── bedrock_provider.py  # Bedrock model configuration
+├── gateway/                 # ECS Fargate gateway (Phase 4)
+│   ├── main.py              # Gateway entry point
+│   ├── agentcore_proxy.py   # AIAgent → AgentCore proxy (monkey-patch)
+│   ├── weixin_file_patch.py # Auto-convert long text to .md files for WeChat
+│   ├── healthcheck.py       # ECS health-check HTTP server
+│   └── Dockerfile           # Gateway container image
 ├── lambda/                  # AWS Lambda functions
 │   ├── router/              # Channel webhook → AgentCore dispatcher
 │   ├── cron/                # Scheduled task execution
@@ -61,6 +67,7 @@ Hermes Agent runs unmodified inside AgentCore containers. The key integration is
 │   ├── agentcore_stack.py   # IAM roles, S3 workspace bucket
 │   ├── observability_stack.py   # CloudWatch dashboards & alarms
 │   ├── router_stack.py      # API Gateway + Router Lambda
+│   ├── gateway_stack.py     # ECS Fargate gateway (WeChat + Feishu)
 │   ├── cron_stack.py        # Scheduled invocations
 │   └── token_monitoring_stack.py # Token usage analytics
 ├── scripts/
@@ -113,7 +120,41 @@ npm install
 
 # Phase 3: Router Lambda, cron, monitoring
 ./scripts/deploy.sh phase3
+
+# Phase 4 (optional): ECS Gateway for WeChat + Feishu long-lived connections
+./scripts/deploy.sh phase4
 ```
+
+### Phase 4: ECS Gateway (Optional)
+
+Phase 4 deploys an **ECS Fargate gateway** that runs the hermes-agent platform adapters (WeChat long-poll, Feishu WebSocket) in a persistent container. All AI inference is forwarded to AgentCore via `AgentCoreProxyAgent` — the gateway handles only platform protocols.
+
+**When you need Phase 4:**
+- WeChat (企业微信) — requires persistent long-poll connection
+- Feishu WebSocket — lower latency than webhook mode
+
+**What it deploys:**
+- ECR repository for the gateway container image
+- ECS Fargate cluster + service (single task, auto-restart)
+- VPC networking, security groups, IAM roles
+- Secrets Manager integration for platform credentials
+
+**Configure platform credentials after deployment:**
+
+```bash
+# WeChat
+aws secretsmanager put-secret-value --secret-id hermes/weixin/token --secret-string 'YOUR_TOKEN'
+
+# Feishu
+aws secretsmanager put-secret-value --secret-id hermes/feishu/app-id --secret-string 'YOUR_APP_ID'
+aws secretsmanager put-secret-value --secret-id hermes/feishu/app-secret --secret-string 'YOUR_SECRET'
+```
+
+**Features:**
+- Long text auto-converted to `.md` files for WeChat delivery (configurable threshold via `WEIXIN_FILE_THRESHOLD`)
+- Conversation history forwarded to AgentCore for multi-turn context
+- Cold start retry with exponential backoff (5s → 10s → 20s)
+- Health check endpoint at `http://localhost:8080/health`
 
 ## Invocation
 
@@ -169,6 +210,17 @@ Configure webhooks after Phase 3 deployment:
 ./scripts/setup_slack.sh
 ```
 
+### WeChat (Phase 4 — ECS Gateway)
+
+WeChat requires a persistent long-poll connection and is only available via the Phase 4 ECS gateway.
+
+1. Deploy Phase 4: `./scripts/deploy.sh phase4`
+2. Store WeChat token in Secrets Manager:
+   ```bash
+   aws secretsmanager put-secret-value --secret-id hermes/weixin/token --secret-string 'YOUR_TOKEN'
+   ```
+3. Long responses (> 2000 chars) are automatically delivered as `.md` files
+
 ### Feishu (Lark)
 
 1. Create an app at [Feishu Open Platform](https://open.feishu.cn)
@@ -199,8 +251,9 @@ Key settings in `cdk.json`:
 | Bedrock Claude | $100–500 |
 | VPC + NAT | $30–45 |
 | Lambda + API GW + DynamoDB | $15–25 |
+| ECS Fargate Gateway (Phase 4) | $15–30 |
 | S3 + Secrets + CloudWatch | $10–20 |
-| **Total** | **~$210–740** |
+| **Total** | **~$220–770** |
 
 ## Documentation
 

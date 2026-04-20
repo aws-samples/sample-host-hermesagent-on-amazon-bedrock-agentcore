@@ -1,5 +1,11 @@
 """Bedrock LLM provider configuration for hermes-agent.
 
+.. deprecated::
+    This module is **not currently used** by the runtime.  The active
+    integration path is the Anthropic SDK monkey-patch in
+    ``app/hermes/main.py``.  This file is retained as a reference for a
+    potential future litellm-based provider route.
+
 This module configures litellm as a transparent OpenAI-compatible proxy that
 routes model calls to Amazon Bedrock ConverseStream.  hermes-agent's existing
 multi-provider architecture only needs a ``base_url`` override to use it.

@@ -263,13 +263,26 @@ aws secretsmanager put-secret-value \
 
 ### Feishu (Lark)
 
-1. Create an app at [Feishu Open Platform](https://open.feishu.cn)
-2. Enable Bot capability, configure permissions (`im:message`, `im:message:send_as_bot`)
-3. Set Event Subscription URL to `{API_URL}webhook/feishu`, subscribe to `im.message.receive_v1`
-4. Store App ID, App Secret, Verification Token in Secrets Manager
-5. Add user `open_id` to DynamoDB allowlist
+Feishu supports two connection modes:
 
-See [docs/FEISHU_SETUP.md](docs/FEISHU_SETUP.md) for step-by-step instructions.
+| | Webhook (Phase 3) | WebSocket (Phase 4) |
+|--|--|--|
+| Connection | Feishu POST → API Gateway → Lambda | ECS container → Feishu WebSocket |
+| Public URL required | Yes | No |
+| Latency | Higher (Lambda cold start) | Lower (persistent connection) |
+| Setup complexity | Event subscription URL config | Just App ID + Secret |
+
+Run the interactive setup script:
+
+```bash
+./scripts/setup_feishu.sh             # Interactive mode selection
+./scripts/setup_feishu.sh webhook     # Webhook mode (Phase 3)
+./scripts/setup_feishu.sh websocket   # WebSocket mode (Phase 4, recommended)
+```
+
+The script will guide you through: creating the app, storing credentials, verifying connectivity, configuring the chosen mode, and adding users to the allowlist.
+
+See [docs/FEISHU_SETUP.md](docs/FEISHU_SETUP.md) for detailed manual instructions.
 
 ## Configuration
 

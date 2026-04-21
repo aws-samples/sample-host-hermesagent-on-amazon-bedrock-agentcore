@@ -290,11 +290,24 @@ aws secretsmanager put-secret-value \
 
 ### 飞书 (Feishu/Lark)
 
-1. 在 [飞书开放平台](https://open.feishu.cn) 创建自建应用
-2. 开启机器人能力，配置权限（`im:message`、`im:message:send_as_bot`）
-3. 事件订阅地址填写 `{API_URL}webhook/feishu`，订阅 `im.message.receive_v1` 事件
-4. 将 App ID、App Secret、Verification Token 存入 Secrets Manager
-5. 添加用户 open_id 到 DynamoDB 白名单
+飞书支持两种连接模式：
+
+| | Webhook (Phase 3) | WebSocket (Phase 4) |
+|--|--|--|
+| 连接方式 | 飞书 POST → API Gateway → Lambda | ECS 容器 → 飞书 WebSocket |
+| 需要公网 URL | 是 | 否 |
+| 延迟 | 较高（Lambda 冷启动） | 较低（持久连接） |
+| 配置复杂度 | 需配置事件订阅 URL | 只需 App ID + Secret |
+
+运行交互式配置脚本：
+
+```bash
+./scripts/setup_feishu.sh             # 交互式选择模式
+./scripts/setup_feishu.sh webhook     # Webhook 模式 (Phase 3)
+./scripts/setup_feishu.sh websocket   # WebSocket 模式 (Phase 4, 推荐)
+```
+
+脚本将引导你完成：创建应用、存储凭证、验证连通性、配置连接模式、添加用户白名单。
 
 详见 [docs/FEISHU_SETUP.md](docs/FEISHU_SETUP.md)。
 

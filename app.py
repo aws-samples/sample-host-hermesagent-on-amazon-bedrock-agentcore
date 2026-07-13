@@ -10,6 +10,8 @@ Phase 2 (``agentcore deploy``) runs outside CDK.
 
 from __future__ import annotations
 
+import os
+
 import aws_cdk as cdk
 
 from stacks.vpc_stack import HermesVpcStack
@@ -26,6 +28,20 @@ app = cdk.App()
 
 project = app.node.try_get_context("project_name") or "hermes-agentcore"
 
+# Resolve the deployment region so it is configurable from a single place
+# (cdk.json `context.aws_region`) rather than depending on the caller's ambient
+# AWS_REGION. Precedence: cdk.json context -> CDK_DEFAULT_REGION -> AWS_REGION.
+# Applied as an explicit cdk.Environment on every stack below; without this the
+# stacks are region-agnostic and silently follow whatever region the shell
+# happens to have set.
+region = (
+    app.node.try_get_context("aws_region")
+    or os.environ.get("CDK_DEFAULT_REGION")
+    or os.environ.get("AWS_REGION")
+)
+account = os.environ.get("CDK_DEFAULT_ACCOUNT")
+env = cdk.Environment(account=account, region=region)
+
 # Optional: read AgentCore runtime IDs injected by Phase 2.
 agentcore_runtime_arn = app.node.try_get_context("agentcore_runtime_arn") or ""
 agentcore_qualifier = app.node.try_get_context("agentcore_qualifier") or ""
@@ -35,17 +51,18 @@ alarm_email = app.node.try_get_context("alarm_email") or ""
 # Phase 1 stacks (no runtime IDs required)
 # --------------------------------------------------------------------------
 
-vpc_stack = HermesVpcStack(app, f"{project}-vpc")
+vpc_stack = HermesVpcStack(app, f"{project}-vpc", env=env)
 
-security_stack = HermesSecurityStack(app, f"{project}-security")
+security_stack = HermesSecurityStack(app, f"{project}-security", env=env)
 
-guardrails_stack = HermesGuardrailsStack(app, f"{project}-guardrails")
+guardrails_stack = HermesGuardrailsStack(app, f"{project}-guardrails", env=env)
 
 agentcore_stack = HermesAgentCoreStack(
     app,
     f"{project}-agentcore",
     vpc=vpc_stack.vpc,
     kms_key_arn=security_stack.kms_key.key_arn,
+    env=env,
 )
 agentcore_stack.add_dependency(vpc_stack)
 agentcore_stack.add_dependency(security_stack)
@@ -54,6 +71,7 @@ observability_stack = HermesObservabilityStack(
     app,
     f"{project}-observability",
     alarm_email=alarm_email,
+    env=env,
 )
 
 # --------------------------------------------------------------------------
@@ -67,20 +85,25 @@ router_stack = HermesRouterStack(
     bucket_name=agentcore_stack.bucket.bucket_name,
     agentcore_runtime_arn=agentcore_runtime_arn,
     agentcore_qualifier=agentcore_qualifier,
+    kms_key_arn=security_stack.kms_key.key_arn,
+    env=env,
 )
 router_stack.add_dependency(agentcore_stack)
+router_stack.add_dependency(security_stack)
 
 cron_stack = HermesCronStack(
     app,
     f"{project}-cron",
     agentcore_runtime_arn=agentcore_runtime_arn,
     agentcore_qualifier=agentcore_qualifier,
+    env=env,
 )
 
 token_monitoring_stack = HermesTokenMonitoringStack(
     app,
     f"{project}-token-monitoring",
     alarm_topic_arn=observability_stack.alarm_topic.topic_arn,
+    env=env,
 )
 token_monitoring_stack.add_dependency(observability_stack)
 
@@ -94,6 +117,7 @@ gateway_stack = HermesGatewayStack(
     vpc=vpc_stack.vpc,
     agentcore_runtime_arn=agentcore_runtime_arn,
     agentcore_qualifier=agentcore_qualifier,
+    env=env,
 )
 gateway_stack.add_dependency(vpc_stack)
 

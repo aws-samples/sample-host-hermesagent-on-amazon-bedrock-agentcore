@@ -32,6 +32,22 @@ else
     CDK="npx cdk"
 fi
 
+# Resolve the deployment region from a single source of truth, matching the
+# precedence used by app.py: cdk.json `context.aws_region` first, then the
+# ambient AWS_* env vars, then the configured profile, then a default. This
+# keeps `agentcore deploy` (which reads aws-targets.json) in the same region as
+# the CDK stacks. Override by setting aws_region in cdk.json or exporting
+# AWS_REGION. Note: `aws configure get region` does NOT read the AWS_REGION
+# env var, which is why it is checked separately.
+resolve_region() {
+    local region=""
+    if command -v jq &>/dev/null && [ -f "$PROJECT_DIR/cdk.json" ]; then
+        region=$(jq -r '.context.aws_region // empty' "$PROJECT_DIR/cdk.json")
+    fi
+    region="${region:-${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null)}}}"
+    echo "${region:-us-west-2}"
+}
+
 # Colours.
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -81,7 +97,7 @@ phase2() {
     if [ ! -f "$PROJECT_DIR/agentcore/aws-targets.json" ]; then
         info "Generating agentcore/aws-targets.json from current AWS credentials …"
         _ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-        _REGION=$(aws configure get region 2>/dev/null || echo "us-west-2")
+        _REGION=$(resolve_region)
         cat > "$PROJECT_DIR/agentcore/aws-targets.json" <<TARGETS
 [
   {
@@ -204,7 +220,7 @@ phase4() {
     fi
 
     AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-    AWS_REGION=$(aws configure get region 2>/dev/null || echo "us-west-2")
+    AWS_REGION=$(resolve_region)
     ECR_REPO="${PROJECT_NAME}-gateway"
     ECR_URI="${AWS_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
 

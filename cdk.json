@@ -35,6 +35,7 @@
     "vpc_cidr": "10.0.0.0/16",
     "az_count": 2,
     "alarm_email": "",
+    "aws_region": "",
     "agentcore_runtime_arn": "",
     "agentcore_qualifier": ""
   }

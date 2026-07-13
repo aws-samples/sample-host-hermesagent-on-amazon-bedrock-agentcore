@@ -20,8 +20,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY hermes-agent/ /build/hermes-agent/
 
 # Install hermes-agent + bridge deps into a prefix we can copy later.
+# main.py imports `anthropic` and monkey-patches it to AnthropicBedrock, but
+# `anthropic` is an optional extra in hermes-agent (not a core dependency), so
+# it must be requested explicitly or the container fails at import with
+# ModuleNotFoundError. `anthropic[bedrock]` adds the AnthropicBedrock client
+# used to route inference through Bedrock with SigV4.
 RUN pip install --no-cache-dir --prefix=/install \
-        -e "/build/hermes-agent[cron,mcp]" \
+        -e "/build/hermes-agent[cron,mcp,anthropic]" \
+        "anthropic[bedrock]" \
         boto3 botocore litellm bedrock-agentcore
 
 # Pre-compile .pyc files for faster cold start.

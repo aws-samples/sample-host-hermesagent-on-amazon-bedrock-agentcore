@@ -85,9 +85,11 @@ router_stack = HermesRouterStack(
     bucket_name=agentcore_stack.bucket.bucket_name,
     agentcore_runtime_arn=agentcore_runtime_arn,
     agentcore_qualifier=agentcore_qualifier,
+    kms_key_arn=security_stack.kms_key.key_arn,
     env=env,
 )
 router_stack.add_dependency(agentcore_stack)
+router_stack.add_dependency(security_stack)
 
 cron_stack = HermesCronStack(
     app,

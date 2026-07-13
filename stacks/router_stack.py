@@ -33,6 +33,7 @@ class HermesRouterStack(Stack):
         bucket_name: str,
         agentcore_runtime_arn: str = "",
         agentcore_qualifier: str = "",
+        kms_key_arn: str = "",
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -122,6 +123,18 @@ class HermesRouterStack(Stack):
                 ],
             )
         )
+
+        # The hermes/* secrets are encrypted with the security stack's customer
+        # managed KMS key, so GetSecretValue also requires kms:Decrypt on that
+        # key. Without this the Lambda gets AccessDeniedException ("Access to
+        # KMS is not allowed") when it reads a channel token to reply.
+        if kms_key_arn:
+            self.router_fn.add_to_role_policy(
+                iam.PolicyStatement(
+                    actions=["kms:Decrypt"],
+                    resources=[kms_key_arn],
+                )
+            )
 
         # Allow Lambda to write to S3 (photo uploads).
         self.router_fn.add_to_role_policy(

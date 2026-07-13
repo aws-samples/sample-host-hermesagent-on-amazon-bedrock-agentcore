@@ -23,6 +23,18 @@ cd "$PROJECT_DIR"
 MODE="${1:-interactive}"
 PROJECT_NAME="hermes-agentcore"
 
+# Resolve the region from a single source of truth (matches scripts/deploy.sh
+# and app.py): cdk.json `context.aws_region` first, then AWS_* env, then the
+# configured profile, then a default.
+resolve_region() {
+    local region=""
+    if command -v jq &>/dev/null && [ -f "$PROJECT_DIR/cdk.json" ]; then
+        region=$(jq -r '.context.aws_region // empty' "$PROJECT_DIR/cdk.json")
+    fi
+    region="${region:-${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null)}}}"
+    echo "${region:-us-west-2}"
+}
+
 # Activate virtual environment if present.
 if [ -f "$PROJECT_DIR/.venv/bin/activate" ]; then
     # shellcheck disable=SC1091
@@ -61,7 +73,7 @@ case "$MODE" in
         ;;
 esac
 
-REGION=$(aws configure get region 2>/dev/null || echo "us-west-2")
+REGION=$(resolve_region)
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "unknown")
 
 # --------------------------------------------------------------------------
